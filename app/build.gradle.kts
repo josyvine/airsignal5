@@ -65,7 +65,9 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug { 
+      signingConfig = signingConfigs.getByName("debugConfig") 
+    }
   }
   
   compileOptions {
@@ -77,9 +79,23 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    viewBinding = true
+  }
+
+  packaging {
+    resources {
+      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+    jniLibs {
+      useLegacyPackaging = true
+    }
   }
   
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions { 
+    unitTests { 
+      isIncludeAndroidResources = true 
+    } 
+  }
   
   dependenciesInfo {
     includeInApk = false
@@ -97,8 +113,6 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-// Some unused dependencies are commented out below instead of being removed.
-// This makes it easy to add them back in the future if needed.
 dependencies {
   implementation(libs.androidx.appcompat)
   implementation(libs.google.material)
