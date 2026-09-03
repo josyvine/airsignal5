@@ -25,6 +25,7 @@ import androidx.core.content.FileProvider;
 import androidx.fragment.app.Fragment;
 
 import com.example.R;
+import com.example.audio.ModulationManager;
 import com.example.database.TransferDatabase;
 import com.example.utils.AirLogger;
 import com.example.utils.FileAssembler;
@@ -46,11 +47,14 @@ public class SettingsFragment extends Fragment {
     private TextView tvDefaultDialerStatus;
     private TextView tvBaudRateVal;
     private Slider sliderBaudRate;
+    private ModulationManager modulationManager;
 
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container, @Nullable Bundle savedInstanceState) {
         View view = inflater.inflate(R.layout.fragment_settings, container, false);
+
+        modulationManager = ModulationManager.getInstance(requireContext());
 
         tvDefaultSmsStatus = view.findViewById(R.id.tvDefaultSmsStatus);
         tvDefaultDialerStatus = view.findViewById(R.id.tvDefaultDialerStatus);
@@ -80,16 +84,29 @@ public class SettingsFragment extends Fragment {
             }
         });
 
+        // Initialize Baud Rate Slider directly from ModulationManager
         if (sliderBaudRate != null) {
+            int currentBaud = modulationManager.getBaudRate();
+            // Snap to valid slider range (300 to 2400)
+            float sliderVal = Math.max(sliderBaudRate.getValueFrom(), Math.min(sliderBaudRate.getValueTo(), (float) currentBaud));
+            sliderBaudRate.setValue(sliderVal);
+            updateBaudRateLabel((int) sliderVal);
+
             sliderBaudRate.addOnChangeListener(new Slider.OnChangeListener() {
                 @Override
                 public void onValueChange(@NonNull Slider slider, float value, boolean fromUser) {
                     int baud = (int) value;
-                    if (tvBaudRateVal != null) {
-                        tvBaudRateVal.setText(baud + " Baud (FSK Tones)");
+                    updateBaudRateLabel(baud);
+                    if (fromUser && isAdded() && getContext() != null) {
+                        modulationManager.setBaudRate(baud);
                     }
                 }
             });
+        }
+
+        // Tap Baud Rate Header / Text to switch Modulation Mode (FSK vs GGWave)
+        if (tvBaudRateVal != null) {
+            tvBaudRateVal.setOnClickListener(v -> showModulationModeSelectionDialog());
         }
 
         // Action Log Viewer Handlers
@@ -106,7 +123,7 @@ public class SettingsFragment extends Fragment {
             });
         }
 
-        // Safe Dynamic Resolution for Received File Management Handlers
+        // Received File Management Handlers
         int viewReceivedId = getResources().getIdentifier("btnViewReceivedFiles", "id", requireContext().getPackageName());
         if (viewReceivedId != 0) {
             View btnViewReceived = view.findViewById(viewReceivedId);
@@ -124,6 +141,48 @@ public class SettingsFragment extends Fragment {
         }
 
         return view;
+    }
+
+    private void updateBaudRateLabel(int baud) {
+        if (tvBaudRateVal != null) {
+            String standardName;
+            if (baud <= 300) {
+                standardName = "Bell 103 (Cellular Call Standard)";
+            } else if (baud <= 600) {
+                standardName = "Medium Speed FSK";
+            } else if (baud <= 1200) {
+                standardName = "Bell 202 Standard";
+            } else {
+                standardName = "Turbo High-Speed";
+            }
+
+            ModulationManager.Mode mode = modulationManager.getMode();
+            tvBaudRateVal.setText(baud + " Baud [" + mode.name() + " - " + standardName + "]");
+        }
+    }
+
+    private void showModulationModeSelectionDialog() {
+        CharSequence[] modes = new CharSequence[]{
+                "FSK Audio Modulation (Bell 103 / 202 Single Tone Shifts)",
+                "GGWave Audio Engine (Multi-Tone MFSK + Reed-Solomon FEC)"
+        };
+
+        int currentIdx = (modulationManager.getMode() == ModulationManager.Mode.FSK) ? 0 : 1;
+
+        new AlertDialog.Builder(requireContext())
+                .setTitle("Default Audio Modulation Engine")
+                .setSingleChoiceItems(modes, currentIdx, (dialog, which) -> {
+                    ModulationManager.Mode selectedMode = (which == 0)
+                            ? ModulationManager.Mode.FSK
+                            : ModulationManager.Mode.GGWAVE;
+
+                    modulationManager.setMode(selectedMode);
+                    updateBaudRateLabel(modulationManager.getBaudRate());
+                    Toast.makeText(requireContext(), "Default Mode: " + selectedMode.name(), Toast.LENGTH_SHORT).show();
+                    dialog.dismiss();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     /**
@@ -304,6 +363,7 @@ public class SettingsFragment extends Fragment {
     }
 
     private void updateRoleStatuses() {
+        if (getContext() == null) return;
         boolean smsDefault = SmsRoleManager.isDefaultSmsApp(requireContext());
         boolean dialerDefault = SmsRoleManager.isDefaultDialerApp(requireContext());
 
@@ -319,6 +379,9 @@ public class SettingsFragment extends Fragment {
     public void onResume() {
         super.onResume();
         updateRoleStatuses();
+        if (sliderBaudRate != null && modulationManager != null) {
+            updateBaudRateLabel((int) sliderBaudRate.getValue());
+        }
     }
 
     private int dpToPx(int dp) {
