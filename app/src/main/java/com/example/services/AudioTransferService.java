@@ -21,10 +21,8 @@ import androidx.core.content.ContextCompat;
 
 import com.example.audio.AudioEncoder;
 import com.example.audio.AudioReceiver;
+import com.example.audio.ModulationManager;
 import com.example.database.TransferDatabase;
-import com.example.knowledge.PhoneticImageTransceiver;
-import com.example.knowledge.VisualRenderer;
-import com.example.models.TemplateToken;
 import com.example.models.TransferItem;
 import com.example.utils.AirLogger;
 import com.example.utils.DataPacketManager;
@@ -33,6 +31,7 @@ import com.example.utils.FileAssembler;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -52,8 +51,6 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
     public static final String ACTION_EXECUTE_STAGED_TRANSMISSION = "com.example.ACTION_EXECUTE_STAGED_TRANSMISSION";
     public static final String ACTION_RECEIVER_MODE_ACTIVE = "com.example.ACTION_RECEIVER_MODE_ACTIVE";
     public static final String ACTION_STOP_SERVICE = "com.example.ACTION_STOP_SERVICE";
-
-    // New Local Air-Gap Acoustic Actions (No Voice Call Required)
     public static final String ACTION_START_LOCAL_RECEIVER = "com.example.ACTION_START_LOCAL_RECEIVER";
     public static final String ACTION_SEND_LOCAL_PHONETIC = "com.example.ACTION_SEND_LOCAL_PHONETIC";
 
@@ -65,10 +62,9 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
     public static final String EXTRA_FILE_SIZE = "extra_file_size";
     public static final String EXTRA_FILE_ID = "extra_file_id";
 
-    // Internal container for holding queued transmission payloads while call is dialing
     private static class StagedPayload {
         String action;
-        byte[] tokenBytes;
+        byte[] rawPayloadBytes;
         String filePath;
         String fileName;
         long fileSize;
@@ -84,9 +80,6 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
     private PowerManager.WakeLock wakeLock;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private boolean isListening = false;
-
-    // Session buffer for accumulating multi-chunk phonetic image transmissions
-    private final ByteArrayOutputStream imageStreamBuffer = new ByteArrayOutputStream();
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -105,10 +98,12 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AirSignal::AudioTransferWakeLock");
         }
 
-        // Standard Bell 202 FSK standard (1200 Baud) for acoustic stability
-        audioEncoder = new AudioEncoder(1200);
-        audioReceiver = new AudioReceiver(this);
-        audioReceiver.setBaudRate(1200);
+        int configuredBaud = ModulationManager.getInstance(this).getBaudRate();
+        ModulationManager.Mode configuredMode = ModulationManager.getInstance(this).getMode();
+
+        audioEncoder = new AudioEncoder(configuredBaud, configuredMode);
+        audioReceiver = new AudioReceiver(this, this);
+        audioReceiver.setBaudRate(configuredBaud);
 
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         notificationBuilder = new NotificationCompat.Builder(this, CHANNEL_ID)
@@ -136,12 +131,11 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
         if (ACTION_STOP_SERVICE.equals(action)) {
             stagedPayload = null;
-            imageStreamBuffer.reset();
             stopSelf();
             return START_NOT_STICKY;
         }
 
-        // 1. Standalone Local Receiver Mode (No Phone Call Required)
+        // Standalone Local Receiver Mode
         if (ACTION_START_LOCAL_RECEIVER.equals(action)) {
             AirLogger.i(TAG, "Starting Standalone Local Receiver Mode");
             ensureAudioRoutingAndListening();
@@ -149,23 +143,22 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
             return START_STICKY;
         }
 
-        // 2. Standalone Local Phonetic Transmission (5s delay -> Wake-up -> 5s countdown -> Data)
+        // Standalone Local Transmission
         if (ACTION_SEND_LOCAL_PHONETIC.equals(action)) {
             String imagePath = intent.getStringExtra(EXTRA_IMAGE_PATH);
             String fileName = intent.getStringExtra(EXTRA_FILE_NAME);
             long fileSize = intent.getLongExtra(EXTRA_FILE_SIZE, 0);
 
-            executeLocalPhoneticTransmission(imagePath, fileName, fileSize);
+            executeLocalAudioTransmission(imagePath, fileName, fileSize);
             return START_STICKY;
         }
 
-        // Call transitioned to ACTIVE: Engage receiver listening and prepare audio routing
+        // Call transitioned to ACTIVE: Engage receiver listening
         if (ACTION_CALL_ACTIVE.equals(action)) {
             ensureAudioRoutingAndListening();
             if (stagedPayload != null) {
                 updateNotification("Call connected. Awaiting receiver handshake or tap transmit...", 0);
             } else {
-                // Receiver side: Automatically transmit the AIR_ACK:RECEIVER_READY handshake tone
                 mainHandler.postDelayed(() -> {
                     ensureAudioRoutingAndListening();
                     audioEncoder.transmitReceiverReadyAck(null);
@@ -182,7 +175,7 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
             return START_STICKY;
         }
 
-        // Check if an outbound transfer action was received
+        // Outbound transfer actions
         if (ACTION_SEND_TOKEN.equals(action)
                 || ACTION_SEND_PHONETIC_IMAGE.equals(action)
                 || ACTION_SEND_BINARY_FILE.equals(action)
@@ -191,7 +184,7 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
             StagedPayload payload = new StagedPayload();
             payload.action = action;
-            payload.tokenBytes = intent.getByteArrayExtra(EXTRA_TOKEN_PAYLOAD);
+            payload.rawPayloadBytes = intent.getByteArrayExtra(EXTRA_TOKEN_PAYLOAD);
             payload.filePath = intent.getStringExtra(EXTRA_IMAGE_PATH);
             if (payload.filePath == null) {
                 payload.filePath = intent.getStringExtra(EXTRA_FILE_PATH);
@@ -205,15 +198,14 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
             stagedPayload = payload;
 
-            // Check if call is already connected in ACTIVE state
             Call activeCall = AirSignalInCallService.getActiveCall();
             if (activeCall != null && activeCall.getState() == Call.STATE_ACTIVE) {
-                AirLogger.i(TAG, "Call is active. Payload staged for in-call execution.");
+                AirLogger.i(TAG, "Call is active. Payload staged for immediate in-call execution.");
                 ensureAudioRoutingAndListening();
-                updateNotification("Payload staged. Tap 'Transmit Data' or await handshake...", 0);
+                executeStagedPayloadIfPresent();
             } else {
-                AirLogger.i(TAG, "Call is not yet active (Dialing/Ringing). Payload staged safely.");
-                updateNotification("Payload staged. Waiting for recipient to answer...", 0);
+                AirLogger.i(TAG, "Call is dialing/ringing. Payload staged safely.");
+                updateNotification("Payload staged. Waiting for call connection...", 0);
             }
             return START_STICKY;
         }
@@ -222,63 +214,22 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
         return START_STICKY;
     }
 
-    /**
-     * Executes the local standalone transmission sequence without a phone call:
-     * 5s silence -> Wake-up tone -> 5s sync countdown -> Full acoustic FSK stream.
-     */
-    private void executeLocalPhoneticTransmission(final String imagePath, final String fileName, final long fileSize) {
+    private void executeLocalAudioTransmission(final String filePath, final String fileName, final long fileSize) {
         new Thread(() -> {
             AirLogger.i(TAG, "Starting Local Acoustic Transmission sequence...");
 
-            // 1. Initial 5-second silent delay
-            for (int sec = 5; sec > 0; sec--) {
+            // 3-second delay to position phones
+            for (int sec = 3; sec > 0; sec--) {
                 final int s = sec;
-                mainHandler.post(() -> updateNotification("Position phones nearby. Starting in " + s + "s...", (5 - s) * 20));
+                mainHandler.post(() -> updateNotification("Position phones nearby. Starting in " + s + "s...", (3 - s) * 33));
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ignored) {}
             }
 
-            // 2. Play wake-up activation acoustic signal
             mainHandler.post(() -> {
                 ensureAudioRoutingAndListening();
-                updateNotification("Transmitting Wake-Up signal to receiver...", 0);
-
-                audioEncoder.transmitActivationCommand(new AudioEncoder.OnTransmissionProgressListener() {
-                    @Override
-                    public void onProgress(int currentPacket, int totalPackets, int percent) {}
-
-                    @Override
-                    public void onComplete() {
-                        AirLogger.i(TAG, "Local Wake-Up signal transmitted. Starting 5-second sync countdown...");
-                        startLocalFiveSecondSyncAndTransmit(imagePath, fileName, fileSize);
-                    }
-
-                    @Override
-                    public void onError(Exception e) {
-                        AirLogger.e(TAG, "Error transmitting local wake-up signal, proceeding with fallback countdown", e);
-                        startLocalFiveSecondSyncAndTransmit(imagePath, fileName, fileSize);
-                    }
-                });
-            });
-        }).start();
-    }
-
-    private void startLocalFiveSecondSyncAndTransmit(final String imagePath, final String fileName, final long fileSize) {
-        new Thread(() -> {
-            // 3. Second 5-second synchronization countdown
-            for (int sec = 5; sec > 0; sec--) {
-                final int s = sec;
-                mainHandler.post(() -> updateNotification("Receiver awakened. Synchronizing channel (" + s + "s)...", (5 - s) * 20));
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException ignored) {}
-            }
-
-            // 4. Transmit full phonetic image audio stream
-            mainHandler.post(() -> {
-                ensureAudioRoutingAndListening();
-                transmitPhoneticImageInternal(imagePath, fileName, fileSize);
+                transmitBinaryFileInternal(filePath, fileName, fileSize, "LOCAL_" + System.currentTimeMillis());
             });
         }).start();
     }
@@ -297,10 +248,6 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
                 int maxMusicVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, maxMusicVol, 0);
-
-                AirLogger.i(TAG, "Audio routing configured: Mode=" + audioManager.getMode() +
-                        ", Speaker=" + audioManager.isSpeakerphoneOn() +
-                        ", MusicVol=" + audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) + "/" + maxMusicVol);
             } catch (Exception e) {
                 AirLogger.e(TAG, "Error configuring AudioManager routing parameters", e);
             }
@@ -323,82 +270,37 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
         mainHandler.postDelayed(() -> {
             ensureAudioRoutingAndListening();
-            updateNotification("Sending activation command to receiver...", 0);
+            updateNotification("Transmitting data into call stream...", 0);
 
             Intent startBroadcast = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
             startBroadcast.putExtra(FileAssembler.EXTRA_STATUS, "TRANSFERRING");
             sendBroadcast(startBroadcast);
 
-            audioEncoder.transmitActivationCommand(new AudioEncoder.OnTransmissionProgressListener() {
-                @Override
-                public void onProgress(int currentPacket, int totalPackets, int percent) {}
-
-                @Override
-                public void onComplete() {
-                    AirLogger.i(TAG, "Activation command transmitted. Entering 7-second synchronization countdown...");
-                    startSevenSecondCountdownThenTransmit(payload);
-                }
-
-                @Override
-                public void onError(Exception e) {
-                    AirLogger.e(TAG, "Error transmitting activation command, proceeding with fallback countdown", e);
-                    startSevenSecondCountdownThenTransmit(payload);
-                }
-            });
-        }, 800);
-    }
-
-    private void startSevenSecondCountdownThenTransmit(final StagedPayload payload) {
-        new Thread(() -> {
-            for (int sec = 7; sec > 0; sec--) {
-                final int s = sec;
-                mainHandler.post(() -> updateNotification("Receiver activated. Synchronizing channel (" + s + "s)...", (7 - s) * 14));
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException ignored) {}
+            if (payload.rawPayloadBytes != null && payload.rawPayloadBytes.length > 0) {
+                transmitRawBytesInternal(payload.rawPayloadBytes, payload.fileName);
+            } else {
+                transmitBinaryFileInternal(payload.filePath, payload.fileName, payload.fileSize, payload.fileId);
             }
-
-            mainHandler.post(() -> {
-                try {
-                    ensureAudioRoutingAndListening();
-                    if (ACTION_SEND_TOKEN.equals(payload.action)) {
-                        transmitTokenInternal(payload.tokenBytes);
-                    } else if (ACTION_SEND_PHONETIC_IMAGE.equals(payload.action)) {
-                        transmitPhoneticImageInternal(payload.filePath, payload.fileName, payload.fileSize);
-                    } else if (ACTION_SEND_BINARY_FILE.equals(payload.action) || ACTION_SEND_AUDIO_DATA.equals(payload.action) || ACTION_SEND_RAW_BINARY.equals(payload.action)) {
-                        transmitBinaryFileInternal(payload.filePath, payload.fileName, payload.fileSize, payload.fileId);
-                    }
-                } catch (Exception e) {
-                    AirLogger.e(TAG, "Error executing staged transmission", e);
-                    updateNotification("Transmission Error: " + e.getMessage(), 0);
-                }
-            });
-        }).start();
+        }, 500);
     }
 
-    private void transmitTokenInternal(byte[] tokenBytes) {
-        if (tokenBytes == null || tokenBytes.length == 0) {
-            AirLogger.e(TAG, "Cannot transmit token: payload is null or empty");
-            return;
-        }
+    private void transmitRawBytesInternal(byte[] bytes, String fileName) {
+        updateNotification("Transmitting audio payload...", 10);
 
-        TemplateToken token = TemplateToken.fromByteArray(tokenBytes);
-        if (token == null) {
-            AirLogger.e(TAG, "Cannot parse template token bytes");
-            return;
-        }
+        ModulationManager.Mode currentMode = ModulationManager.getInstance(this).getMode();
+        audioEncoder.setModulationMode(currentMode);
+        audioEncoder.setBaudRate(ModulationManager.getInstance(this).getBaudRate());
 
-        updateNotification("Transmitting Semantic Token...", 10);
-        audioEncoder.transmitPhoneticToken(token, new AudioEncoder.OnTransmissionProgressListener() {
+        audioEncoder.transmitDataOverAudio(bytes, new AudioEncoder.OnTransmissionProgressListener() {
             @Override
             public void onProgress(int currentPacket, int totalPackets, int percent) {
-                updateNotification("Transmitting Semantic Token...", percent);
+                updateNotification("Transmitting data: " + percent + "%", percent);
             }
 
             @Override
             public void onComplete() {
-                AirLogger.i(TAG, "Semantic Token transmission completed successfully.");
-                updateNotification("Token Transmitted! Listening for data...", 100);
+                AirLogger.i(TAG, "Raw payload transmission completed successfully.");
+                updateNotification("Data Transmitted Successfully!", 100);
 
                 Intent completeBroadcast = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
                 completeBroadcast.putExtra(FileAssembler.EXTRA_STATUS, "COMPLETED");
@@ -409,80 +311,16 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
             @Override
             public void onError(Exception e) {
-                AirLogger.e(TAG, "Token transmission failed", e);
+                AirLogger.e(TAG, "Data transmission error", e);
                 updateNotification("Transmission Error: " + e.getMessage(), 0);
             }
         });
     }
 
-    private void transmitPhoneticImageInternal(String imagePath, String fileName, long fileSize) {
-        if (imagePath == null) {
-            AirLogger.e(TAG, "Cannot transmit phonetic image: imagePath is null");
-            return;
-        }
-
-        File imgFile = new File(imagePath);
-        if (!imgFile.exists()) {
-            AirLogger.e(TAG, "Phonetic image file does not exist: " + imagePath);
-            return;
-        }
-
-        updateNotification("Encoding and transmitting Phonetic Image...", 10);
-        PhoneticImageTransceiver.sendImageViaPhoneticDictionary(
-                getApplicationContext(),
-                imgFile,
-                audioEncoder,
-                new PhoneticImageTransceiver.OnPhoneticTransferListener() {
-                    @Override
-                    public void onProgress(int step, int totalSteps, String statusMessage) {
-                        int percent = (int) (((double) step / (double) Math.max(1, totalSteps)) * 100);
-                        updateNotification("Phonetic Image: " + statusMessage, percent);
-
-                        Intent progressIntent = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
-                        progressIntent.putExtra(FileAssembler.EXTRA_STATUS, "TRANSFERRING");
-                        sendBroadcast(progressIntent);
-                    }
-
-                    @Override
-                    public void onSuccess(int totalTokensSent, int originalBase64Length) {
-                        AirLogger.i(TAG, "Phonetic Image Transmitted successfully! (" + totalTokensSent + " tokens)");
-                        updateNotification("Phonetic Image Sent! (" + totalTokensSent + " tokens)", 100);
-
-                        TransferDatabase db = TransferDatabase.getInstance(getApplicationContext());
-                        TransferItem item = new TransferItem(
-                                "PHON_" + System.currentTimeMillis(),
-                                fileName != null ? fileName : imgFile.getName(),
-                                fileSize > 0 ? fileSize : imgFile.length(),
-                                100,
-                                TransferItem.STATUS_COMPLETED,
-                                TransferItem.MODE_PHONETIC_TOKEN,
-                                totalTokensSent,
-                                totalTokensSent
-                        );
-                        db.insertTransfer(item);
-
-                        Intent broadcast = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
-                        broadcast.putExtra(FileAssembler.EXTRA_STATUS, "COMPLETED");
-                        sendBroadcast(broadcast);
-
-                        mainHandler.postDelayed(() -> updateNotification("Listening for incoming data...", 0), 3000);
-                    }
-
-                    @Override
-                    public void onError(Exception e) {
-                        AirLogger.e(TAG, "Phonetic Image transfer error", e);
-                        updateNotification("Image Send Failed: " + e.getMessage(), 0);
-                    }
-                }
-        );
-    }
-
     private void transmitBinaryFileInternal(String filePath, String fileName, long fileSize, String fileId) {
         if (filePath == null) {
-            AirLogger.w(TAG, "Binary file path is null, generating dummy telemetry data stream");
-            byte[] dummyData = "AirSignal Telemetry Stream Test Data 2026".getBytes(StandardCharsets.UTF_8);
-            List<byte[]> packets = DataPacketManager.createBinaryPackets(dummyData);
-            audioEncoder.transmitRawStream(packets, null);
+            byte[] dummyData = "AirSignal Audio Data Transmission".getBytes(StandardCharsets.UTF_8);
+            transmitRawBytesInternal(dummyData, "message.txt");
             return;
         }
 
@@ -502,12 +340,16 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
         final String effectiveFileId = (fileId != null) ? fileId : ("FILE_" + System.currentTimeMillis());
         final int totalPackets = binaryPackets.size();
 
-        updateNotification("Streaming " + totalPackets + " Binary Packets @ 1200 Baud...", 0);
+        ModulationManager.Mode currentMode = ModulationManager.getInstance(this).getMode();
+        audioEncoder.setModulationMode(currentMode);
+        audioEncoder.setBaudRate(ModulationManager.getInstance(this).getBaudRate());
 
-        audioEncoder.transmitRawStream(binaryPackets, new AudioEncoder.OnTransmissionProgressListener() {
+        updateNotification("Streaming " + totalPackets + " audio packets...", 0);
+
+        audioEncoder.transmitRawStream(binaryPackets, currentMode, new AudioEncoder.OnTransmissionProgressListener() {
             @Override
             public void onProgress(int currentPacket, int total, int percent) {
-                updateNotification("Sending File: " + percent + "% (" + currentPacket + "/" + total + ")", percent);
+                updateNotification("Sending: " + percent + "% (" + currentPacket + "/" + total + ")", percent);
 
                 TransferDatabase db = TransferDatabase.getInstance(getApplicationContext());
                 TransferItem item = new TransferItem(
@@ -516,7 +358,7 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
                         fileSize > 0 ? fileSize : file.length(),
                         percent,
                         "TRANSFERRING",
-                        "RAW_BINARY_1200",
+                        currentMode.name(),
                         total,
                         currentPacket
                 );
@@ -529,8 +371,8 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
 
             @Override
             public void onComplete() {
-                AirLogger.i(TAG, "Lossless binary stream completed successfully.");
-                updateNotification("Binary File Sent Successfully!", 100);
+                AirLogger.i(TAG, "Binary stream completed successfully.");
+                updateNotification("File Sent Successfully!", 100);
 
                 TransferDatabase db = TransferDatabase.getInstance(getApplicationContext());
                 TransferItem item = new TransferItem(
@@ -539,7 +381,7 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
                         fileSize > 0 ? fileSize : file.length(),
                         100,
                         TransferItem.STATUS_COMPLETED,
-                        "RAW_BINARY_1200",
+                        currentMode.name(),
                         totalPackets,
                         totalPackets
                 );
@@ -605,22 +447,21 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
         }
 
         stagedPayload = null;
-        imageStreamBuffer.reset();
         super.onDestroy();
     }
 
     // =========================================================================
-    // AudioReceiver Callback Handlers (Zero-Touch Automation)
+    // AudioReceiver Callback Handlers
     // =========================================================================
 
     @Override
     public void onByteDecoded(byte b) {
-        // Individual raw byte decoded from acoustic FSK tone
+        // Raw byte received
     }
 
     @Override
     public void onReceiverReadyAckReceived() {
-        AirLogger.i(TAG, "Received AIR_ACK:RECEIVER_READY from remote receiver! Automatically releasing staged data stream.");
+        AirLogger.i(TAG, "Received AIR_ACK:RECEIVER_READY from remote receiver!");
         if (stagedPayload != null) {
             ensureAudioRoutingAndListening();
             executeStagedPayloadIfPresent();
@@ -640,68 +481,43 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
     public void onFrameDecoded(byte[] frameData) {
         if (frameData == null || frameData.length == 0) return;
 
-        String previewStr = new String(frameData, StandardCharsets.UTF_8);
-
-        // 1. Phonetic Base64 Image Session Accumulator
-        if (previewStr.contains(PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE) || imageStreamBuffer.size() > 0) {
-            imageStreamBuffer.write(frameData, 0, frameData.length);
-            byte[] currentFullStream = imageStreamBuffer.toByteArray();
-            String fullStreamStr = new String(currentFullStream, StandardCharsets.UTF_8);
-
-            AirLogger.i(TAG, "Accumulating Phonetic Image stream. Buffer size: " + currentFullStream.length + " bytes.");
-
-            // Update Receiver UI live progress
-            Intent liveProgressIntent = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
-            liveProgressIntent.putExtra(FileAssembler.EXTRA_STATUS, "RECEIVING");
-            sendBroadcast(liveProgressIntent);
-            updateNotification("Receiving Image Data (" + currentFullStream.length + " bytes)...", 50);
-
-            // Check if full stream reached completion closure '#' delimiters
-            int firstHash = fullStreamStr.indexOf('#');
-            int lastHash = fullStreamStr.lastIndexOf('#');
-            if (firstHash != -1 && lastHash > firstHash && (fullStreamStr.endsWith("#") || countOccurrences(fullStreamStr, '#') >= 2 || currentFullStream.length > 7000)) {
-                AirLogger.i(TAG, "Complete Phonetic Base64 Image received (" + currentFullStream.length + " bytes)! Reconstructing image.");
-                List<String> tokens = PhoneticImageTransceiver.parseTransmissionToTokens(currentFullStream);
-                PhoneticImageTransceiver.receiveAndReconstructImage(getApplicationContext(), tokens, "received_phonetic_photo.webp");
-
-                imageStreamBuffer.reset();
-
-                updateNotification("Received Phonetic Image!", 100);
-
-                Intent completeBroadcast = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
-                completeBroadcast.putExtra(FileAssembler.EXTRA_STATUS, "COMPLETED");
-                sendBroadcast(completeBroadcast);
-
-                mainHandler.postDelayed(() -> updateNotification("Listening for incoming data...", 0), 3000);
-                return;
-            }
-            return;
-        }
-
-        // 2. Mode 2/3: Pass exact lossless binary frames to FileAssembler for GZIP decompression
         AirLogger.i(TAG, "Received raw binary frame (" + frameData.length + " bytes). Passing to Assembler.");
         FileAssembler.processIncomingBinaryFrame(getApplicationContext(), frameData);
     }
 
-    private int countOccurrences(String str, char ch) {
-        int count = 0;
-        for (int i = 0; i < str.length(); i++) {
-            if (str.charAt(i) == ch) count++;
-        }
-        return count;
-    }
-
     @Override
-    public void onTokenDecoded(TemplateToken token) {
-        if (token == null) return;
+    public void onPayloadDecoded(String payload) {
+        if (payload == null || payload.isEmpty()) return;
 
-        AirLogger.i(TAG, "Received valid Mode 4 Template Token! Category ID: " + token.getCategoryId());
+        AirLogger.i(TAG, "Received decoded payload string (" + payload.length() + " chars)");
+        updateNotification("Received Payload: " + payload.substring(0, Math.min(20, payload.length())) + "...", 100);
 
-        // Mode 4: Automatic zero-touch visual layout reconstruction popup
-        VisualRenderer.showVisualResultDialog(getApplicationContext(), token);
+        try {
+            File receivedDir = FileAssembler.getReceivedFilesDir(getApplicationContext());
+            File textFile = new File(receivedDir, "received_message_" + System.currentTimeMillis() + ".txt");
+            try (FileOutputStream fos = new FileOutputStream(textFile)) {
+                fos.write(payload.getBytes(StandardCharsets.UTF_8));
+            }
 
-        updateNotification("Received Emergency Visual Token!", 100);
-        mainHandler.postDelayed(() -> updateNotification("Listening for audio data stream...", 0), 3000);
+            TransferDatabase db = TransferDatabase.getInstance(getApplicationContext());
+            TransferItem item = new TransferItem(
+                    "MSG_" + System.currentTimeMillis(),
+                    textFile.getName(),
+                    textFile.length(),
+                    100,
+                    TransferItem.STATUS_COMPLETED,
+                    "AUDIO_PAYLOAD",
+                    1,
+                    1
+            );
+            db.insertTransfer(item);
+
+            Intent completeBroadcast = new Intent(FileAssembler.ACTION_TRANSFER_PROGRESS);
+            completeBroadcast.putExtra(FileAssembler.EXTRA_STATUS, "COMPLETED");
+            sendBroadcast(completeBroadcast);
+        } catch (Exception e) {
+            AirLogger.e(TAG, "Error saving decoded payload text", e);
+        }
     }
 
     @Override
@@ -716,7 +532,7 @@ public class AudioTransferService extends Service implements AudioReceiver.Audio
                     "AirSignal Audio Data Channel",
                     NotificationManager.IMPORTANCE_HIGH
             );
-            channel.setDescription("Maintains CPU wake locks and streams FSK modem data.");
+            channel.setDescription("Maintains CPU wake locks and streams audio modem data.");
             NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (manager != null) {
                 manager.createNotificationChannel(channel);
