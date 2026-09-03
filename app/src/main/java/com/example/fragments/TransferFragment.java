@@ -7,11 +7,11 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
-import android.util.Base64;
 import android.util.TypedValue;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -19,6 +19,7 @@ import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
@@ -35,15 +36,10 @@ import androidx.recyclerview.widget.RecyclerView;
 import com.example.R;
 import com.example.adapters.TransferAdapter;
 import com.example.audio.AudioEncoder;
+import com.example.audio.ModulationManager;
 import com.example.call.CallManager;
 import com.example.database.TransferDatabase;
-import com.example.knowledge.PhoneticBase64Dictionary;
-import com.example.knowledge.PhoneticImageTransceiver;
-import com.example.knowledge.PhoneticTokenManager;
-import com.example.knowledge.TemplateCatalog;
-import com.example.knowledge.VisualRenderer;
 import com.example.models.DataPacket;
-import com.example.models.TemplateToken;
 import com.example.models.TransferItem;
 import com.example.services.AirSignalInCallService;
 import com.example.services.AudioTransferService;
@@ -57,7 +53,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
 
@@ -73,10 +69,11 @@ public class TransferFragment extends Fragment {
     private String selectedFileName = "None";
     private long selectedFileSize = 0;
     private File localCachedFile = null;
+    private String pastedPayloadText = null;
 
     private ActivityResultLauncher<String> filePickerLauncher;
 
-    // Real-time UI progress updater for incoming background transfers
+    // Real-time UI progress updater for background transfers
     private final BroadcastReceiver progressReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -92,12 +89,13 @@ public class TransferFragment extends Fragment {
     public void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Native Android Storage File/Image Picker Launcher
+        // Native Android Storage File Picker
         filePickerLauncher = registerForActivityResult(
                 new ActivityResultContracts.GetContent(),
                 uri -> {
                     if (uri != null) {
                         selectedFileUri = uri;
+                        pastedPayloadText = null;
                         cacheSelectedFileLocally(uri);
                     }
                 }
@@ -141,9 +139,7 @@ public class TransferFragment extends Fragment {
         loadTransfers();
 
         view.findViewById(R.id.btnSelectFile).setOnClickListener(v -> showFileSelectionDialog());
-
         view.findViewById(R.id.btnSendSmsData).setOnClickListener(v -> showSmsDataDialog());
-
         view.findViewById(R.id.btnSendAudioData).setOnClickListener(v -> showAudioDataDialog());
 
         return view;
@@ -159,14 +155,14 @@ public class TransferFragment extends Fragment {
         }
     }
 
+    /**
+     * Clean 3-option dialog replacing the old bloated menu.
+     */
     private void showFileSelectionDialog() {
         CharSequence[] options = new CharSequence[]{
-                "Choose Real Image / File from Storage",
-                "Send Image via Phonetic Base64 Dictionary",
-                "Start Local Receiver Mode (Listen for Nearby Sound)",
-                "Create Custom Visual Template (Phonetic)",
-                "Send Exact Lossless File (2400 Baud Audio)",
-                "Preview Receiver Template"
+                "1. Choose Real Image / File from Storage",
+                "2. Paste / Input Raw Base64 or Text",
+                "3. Generate & Transmit Audio (FSK / GGWave)"
         };
 
         new AlertDialog.Builder(requireContext())
@@ -175,15 +171,9 @@ public class TransferFragment extends Fragment {
                     if (which == 0) {
                         filePickerLauncher.launch("*/*");
                     } else if (which == 1) {
-                        sendImageViaPhoneticBase64Dictionary();
+                        showPasteBase64Dialog();
                     } else if (which == 2) {
-                        startLocalReceiverMode();
-                    } else if (which == 3) {
-                        showCustomTemplateBuilderDialog();
-                    } else if (which == 4) {
-                        sendExactLosslessBinaryStream();
-                    } else if (which == 5) {
-                        simulateReceiverPopup();
+                        showTransmitAudioOptionsDialog();
                     }
                 })
                 .show();
@@ -223,129 +213,54 @@ public class TransferFragment extends Fragment {
     }
 
     /**
-     * Starts the microphone on the receiver device to listen for local ambient acoustic transmissions.
+     * Option 2: Paste / Input Raw Base64 or Text.
      */
-    private void startLocalReceiverMode() {
-        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-        serviceIntent.setAction(AudioTransferService.ACTION_START_LOCAL_RECEIVER);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            requireContext().startForegroundService(serviceIntent);
-        } else {
-            requireContext().startService(serviceIntent);
+    private void showPasteBase64Dialog() {
+        LinearLayout layout = new LinearLayout(requireContext());
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dpToPx(20), dpToPx(12), dpToPx(20), dpToPx(12));
+
+        TextView tvInfo = new TextView(requireContext());
+        tvInfo.setText("Paste your Base64 string, token, or custom message below:");
+        tvInfo.setTextColor(Color.LTGRAY);
+        tvInfo.setTextSize(13);
+        layout.addView(tvInfo);
+
+        final EditText etInput = new EditText(requireContext());
+        etInput.setHint("Paste Base64 or text here...");
+        etInput.setMinLines(5);
+        etInput.setMaxLines(10);
+        etInput.setTypeface(Typeface.MONOSPACE);
+        etInput.setTextSize(13);
+        if (pastedPayloadText != null) {
+            etInput.setText(pastedPayloadText);
         }
+        layout.addView(etInput);
 
         new AlertDialog.Builder(requireContext())
-                .setTitle("Local Receiver Mode Active")
-                .setMessage("Microphone is actively listening for nearby acoustic transfers.\n\nPlace the sender phone nearby and produce sound.")
-                .setPositiveButton("OK", null)
-                .show();
-    }
+                .setTitle("Raw Base64 / Text Input")
+                .setView(layout)
+                .setPositiveButton("Set as Active Payload", (dialog, which) -> {
+                    String input = etInput.getText().toString().trim();
+                    if (!input.isEmpty()) {
+                        pastedPayloadText = input;
+                        try {
+                            localCachedFile = new File(requireContext().getCacheDir(), "pasted_payload.txt");
+                            FileOutputStream fos = new FileOutputStream(localCachedFile);
+                            fos.write(input.getBytes(StandardCharsets.UTF_8));
+                            fos.flush();
+                            fos.close();
 
-    /**
-     * Transmits real selected image using Phonetic Base64 Dictionary Block Substitution.
-     * Offers choice between Cellular Phone Call Mode and Local Air-Gap Acoustic Mode.
-     */
-    private void sendImageViaPhoneticBase64Dictionary() {
-        if (localCachedFile == null || !localCachedFile.exists()) {
-            Toast.makeText(requireContext(), "Please select an image file from storage first.", Toast.LENGTH_LONG).show();
-            filePickerLauncher.launch("image/*");
-            return;
-        }
+                            selectedFileName = "pasted_payload.txt";
+                            selectedFileSize = localCachedFile.length();
+                            selectedFileUri = null;
 
-        CharSequence[] modes = new CharSequence[]{
-                "1. Local Audio (Air-Gap / Nearby Phones / No Call)",
-                "2. Data Over Cellular Call (Remote Transmission)"
-        };
-
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Select Phonetic Transmission Mode")
-                .setItems(modes, (dialog, which) -> {
-                    if (which == 0) {
-                        showLocalPhoneticCalculationAndTransmitDialog();
-                    } else if (which == 1) {
-                        showCallPhoneticTransmitDialog();
-                    }
-                })
-                .show();
-    }
-
-    /**
-     * Calculates local phonetic tokens, payload size, and estimated transfer duration, then confirms before sound output.
-     */
-    private void showLocalPhoneticCalculationAndTransmitDialog() {
-        try {
-            byte[] fileBytes = readFileBytes(localCachedFile);
-            if (fileBytes == null || fileBytes.length == 0) {
-                Toast.makeText(requireContext(), "Image file is empty", Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            String rawBase64 = Base64.encodeToString(fileBytes, Base64.NO_WRAP);
-            List<String> phoneticTokens = PhoneticBase64Dictionary.encodeBase64ToPhoneticTokens(rawBase64);
-            byte[] transmissionPayload = PhoneticImageTransceiver.formatTokensForTransmission(phoneticTokens);
-
-            int tokenCount = phoneticTokens.size();
-            int payloadBytes = transmissionPayload.length;
-            // Estimated time: 5s initial silence + 1s wake-up + 5s sync window + audio payload streaming @ 1200 baud
-            int audioSeconds = (int) Math.ceil((payloadBytes * 8.0) / 1200.0);
-            int totalEstimatedSeconds = 5 + 1 + 5 + audioSeconds;
-
-            String details = "File: " + selectedFileName + "\n" +
-                    "Size: " + (selectedFileSize / 1024) + " KB (" + rawBase64.length() + " Base64 chars)\n" +
-                    "Phonetic Tokens: " + tokenCount + " NATO words\n" +
-                    "Payload Size: " + payloadBytes + " bytes\n\n" +
-                    "Estimated Transfer Time: ~" + totalEstimatedSeconds + " seconds\n\n" +
-                    "Timing Sequence:\n" +
-                    "• 5s Silent delay to position phones\n" +
-                    "• Wake-up activation signal to receiver\n" +
-                    "• 5s Synchronization countdown\n" +
-                    "• Acoustic data tone transmission";
-
-            new AlertDialog.Builder(requireContext())
-                    .setTitle("Local Acoustic Transfer Details")
-                    .setMessage(details)
-                    .setPositiveButton("Produce Sound / Transmit", (dialog, which) -> {
-                        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-                        serviceIntent.setAction(AudioTransferService.ACTION_SEND_LOCAL_PHONETIC);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_IMAGE_PATH, localCachedFile.getAbsolutePath());
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
-
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            requireContext().startForegroundService(serviceIntent);
-                        } else {
-                            requireContext().startService(serviceIntent);
+                            Toast.makeText(requireContext(), "Payload set (" + selectedFileSize + " bytes)", Toast.LENGTH_SHORT).show();
+                        } catch (Exception e) {
+                            AirLogger.e(TAG, "Error caching pasted text", e);
                         }
-
-                        Toast.makeText(requireContext(), "Local Transmission Started! (5s delay...)", Toast.LENGTH_LONG).show();
-                    })
-                    .setNegativeButton("Cancel", null)
-                    .show();
-
-        } catch (Exception e) {
-            AirLogger.e(TAG, "Error calculating local phonetic parameters", e);
-            Toast.makeText(requireContext(), "Failed calculating phonetic parameters: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    /**
-     * Cellular Call Phonetic Transmission Setup
-     */
-    private void showCallPhoneticTransmitDialog() {
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Phonetic Image via Cellular Call")
-                .setMessage("File: " + selectedFileName + "\nThis encodes your image into Phonetic Dictionary words and transmits it over an active voice call once answered.")
-                .setPositiveButton("Transmit over Call", (dialog, which) -> {
-                    if (AirSignalInCallService.getActiveCall() != null) {
-                        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-                        serviceIntent.setAction(AudioTransferService.ACTION_SEND_PHONETIC_IMAGE);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_IMAGE_PATH, localCachedFile.getAbsolutePath());
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
-                        requireContext().startService(serviceIntent);
-                        Toast.makeText(requireContext(), "Transmitting over Active Call...", Toast.LENGTH_SHORT).show();
                     } else {
-                        promptPhoneNumberAndPlaceCall(null, localCachedFile, null);
+                        Toast.makeText(requireContext(), "Input cannot be empty", Toast.LENGTH_SHORT).show();
                     }
                 })
                 .setNegativeButton("Cancel", null)
@@ -353,197 +268,148 @@ public class TransferFragment extends Fragment {
     }
 
     /**
-     * Interactive Custom Template Builder Dialog
+     * Option 3: Unified FSK & GGWave Audio Transmission Dialog.
      */
-    private void showCustomTemplateBuilderDialog() {
-        LinearLayout container = new LinearLayout(requireContext());
-        container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(32, 24, 32, 24);
-
-        TextView tvTpl = new TextView(requireContext());
-        tvTpl.setText("Select Base Template:");
-        tvTpl.setTextColor(Color.WHITE);
-
-        Spinner spTemplates = new Spinner(requireContext());
-        List<String> tplNames = new ArrayList<>();
-        tplNames.add("Chalakudy River & Bridge Grid (Map #1)");
-        tplNames.add("Emergency Medical Triage Form (Form #2)");
-        tplNames.add("Roadblock & Infrastructure Assessment (#3)");
-        tplNames.add("Logistics & Supply Drop Grid (#4)");
-        tplNames.add("Search & Rescue Team Status (#5)");
-
-        ArrayAdapter<String> tplAdapter = new ArrayAdapter<>(requireContext(), android.R.layout.simple_spinner_dropdown_item, tplNames);
-        spTemplates.setAdapter(tplAdapter);
-
-        TextView tvIcon = new TextView(requireContext());
-        tvIcon.setText("Select Marker / Hazard Stamp:");
-        tvIcon.setTextColor(Color.WHITE);
-        tvIcon.setPadding(0, 16, 0, 0);
-
-        Spinner spIcons = new Spinner(requireContext());
-        List<String> iconNames = new ArrayList<>();
-        iconNames.add("Flood / Submersion Hazard");
-        iconNames.add("Fire / Heat Hazard");
-        iconNames.add("Roadblock / Structural Damage");
-        iconNames.add("Medical Emergency / Casualty");
-        iconNames.add("Evacuation Shelter / Safe Zone");
-        iconNames.add("Severe Electrical / Gas Hazard");
-
-        ArrayAdapter<String> iconAdapter = new ArrayAdapter<>(requireContext(), android.R.layout.simple_spinner_dropdown_item, iconNames);
-        spIcons.setAdapter(iconAdapter);
-
-        TextView tvSev = new TextView(requireContext());
-        tvSev.setText("Priority / Severity Level:");
-        tvSev.setTextColor(Color.WHITE);
-        tvSev.setPadding(0, 16, 0, 0);
-
-        Spinner spSeverity = new Spinner(requireContext());
-        List<String> sevNames = new ArrayList<>();
-        sevNames.add("Low / Routine");
-        sevNames.add("Medium / Elevated");
-        sevNames.add("High Priority");
-        sevNames.add("CRITICAL EMERGENCY");
-
-        ArrayAdapter<String> sevAdapter = new ArrayAdapter<>(requireContext(), android.R.layout.simple_spinner_dropdown_item, sevNames);
-        spSeverity.setAdapter(sevAdapter);
-
-        TextView tvVal = new TextView(requireContext());
-        tvVal.setText("Metric Value (e.g. Water Depth in cm / Count):");
-        tvVal.setTextColor(Color.WHITE);
-        tvVal.setPadding(0, 16, 0, 0);
-
-        EditText etMetric = new EditText(requireContext());
-        etMetric.setHint("Enter numeric value (e.g., 240)");
-        etMetric.setText("240");
-        etMetric.setTextColor(Color.WHITE);
-
-        container.addView(tvTpl);
-        container.addView(spTemplates);
-        container.addView(tvIcon);
-        container.addView(spIcons);
-        container.addView(tvSev);
-        container.addView(spSeverity);
-        container.addView(tvVal);
-        container.addView(etMetric);
-
-        ScrollView scrollView = new ScrollView(requireContext());
-        scrollView.addView(container);
-
-        new AlertDialog.Builder(requireContext())
-                .setTitle("Custom Visual Template Builder")
-                .setView(scrollView)
-                .setPositiveButton("Transmit via Call", (dialog, which) -> {
-                    int tplId = spTemplates.getSelectedItemPosition() + 1;
-                    int iconId = spIcons.getSelectedItemPosition() + 1;
-                    int sevId = spSeverity.getSelectedItemPosition() + 1;
-                    int val = 0;
-                    try {
-                        val = Integer.parseInt(etMetric.getText().toString().trim());
-                    } catch (Exception ignored) {}
-
-                    TemplateToken customToken = new TemplateToken(
-                            TemplateToken.MODE_PHONETIC_TOKEN,
-                            TemplateToken.CATEGORY_TACTICAL_MAP,
-                            tplId,
-                            18500,
-                            35000,
-                            iconId,
-                            sevId,
-                            val,
-                            0
-                    );
-
-                    if (AirSignalInCallService.getActiveCall() != null) {
-                        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-                        serviceIntent.setAction(AudioTransferService.ACTION_SEND_TOKEN);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_TOKEN_PAYLOAD, customToken.toByteArray());
-                        requireContext().startService(serviceIntent);
-                        Toast.makeText(requireContext(), "Streaming Token into Active Call...", Toast.LENGTH_SHORT).show();
-                    } else {
-                        promptPhoneNumberAndPlaceCall(customToken.toByteArray(), null, null);
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
-    /**
-     * Transmits the real selected file over 2400 Baud FSK continuous audio stream.
-     */
-    private void sendExactLosslessBinaryStream() {
-        if (localCachedFile == null || !localCachedFile.exists()) {
-            Toast.makeText(requireContext(), "Please choose a file from storage first.", Toast.LENGTH_LONG).show();
-            filePickerLauncher.launch("*/*");
+    private void showTransmitAudioOptionsDialog() {
+        if ((localCachedFile == null || !localCachedFile.exists()) && pastedPayloadText == null) {
+            Toast.makeText(requireContext(), "Please select a file or paste text first.", Toast.LENGTH_LONG).show();
+            showFileSelectionDialog();
             return;
         }
 
-        byte[] fileBytes = readFileBytes(localCachedFile);
-        if (fileBytes == null || fileBytes.length == 0) {
-            Toast.makeText(requireContext(), "Selected file is empty.", Toast.LENGTH_SHORT).show();
-            return;
-        }
+        LinearLayout layout = new LinearLayout(requireContext());
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(dpToPx(20), dpToPx(16), dpToPx(20), dpToPx(16));
 
-        List<byte[]> binaryPackets = DataPacketManager.createBinaryPackets(fileBytes);
-        String fileId = UUID.randomUUID().toString().substring(0, 8);
-        double estMinutes = (binaryPackets.size() * 263.0) / (300.0 * 60.0);
+        TextView tvDetails = new TextView(requireContext());
+        tvDetails.setText("File/Payload: " + selectedFileName + " (" + (selectedFileSize > 0 ? selectedFileSize + " B" : "Ready") + ")");
+        tvDetails.setTextColor(Color.WHITE);
+        tvDetails.setTypeface(Typeface.DEFAULT_BOLD);
+        layout.addView(tvDetails);
+
+        TextView tvModeLabel = new TextView(requireContext());
+        tvModeLabel.setText("\nSelect Transmission Modulation:");
+        tvModeLabel.setTextColor(Color.LTGRAY);
+        layout.addView(tvModeLabel);
+
+        Spinner spMode = new Spinner(requireContext());
+        String[] modes = new String[]{
+                "FSK Modulation (Bell 103 / 202 Audio Tones)",
+                "GGWave Audio Engine (MFSK + Reed-Solomon FEC)"
+        };
+        ArrayAdapter<String> modeAdapter = new ArrayAdapter<>(requireContext(), android.R.layout.simple_spinner_dropdown_item, modes);
+        spMode.setAdapter(modeAdapter);
+        layout.addView(spMode);
+
+        TextView tvChannelLabel = new TextView(requireContext());
+        tvChannelLabel.setText("\nSelect Output Channel:");
+        tvChannelLabel.setTextColor(Color.LTGRAY);
+        layout.addView(tvChannelLabel);
+
+        Spinner spChannel = new Spinner(requireContext());
+        String[] channels = new String[]{
+                "1. Stream directly into Active Phone Call",
+                "2. Play via Loudspeaker / Aux Cable (Air-Gap / No Call)",
+                "3. Dial Number & Transmit on Connect"
+        };
+        ArrayAdapter<String> channelAdapter = new ArrayAdapter<>(requireContext(), android.R.layout.simple_spinner_dropdown_item, channels);
+        spChannel.setAdapter(channelAdapter);
+        layout.addView(spChannel);
 
         new AlertDialog.Builder(requireContext())
-                .setTitle("Transmit Exact Lossless File")
-                .setMessage("File: " + selectedFileName + "\nSize: " + (selectedFileSize / 1024) + " KB\nTotal Audio Packets: " + binaryPackets.size() +
-                        "\nEst. Transfer Time: ~" + String.format("%.1f", estMinutes) + " min @ 2400 Baud")
-                .setPositiveButton("Dial Call & Start Stream", (dialog, which) -> {
-                    TransferItem item = new TransferItem(fileId, selectedFileName, selectedFileSize, 0, "QUEUED", "RAW_BINARY_2400", binaryPackets.size(), 0);
-                    transferDb.insertTransfer(item);
+                .setTitle("Transmit Audio Data")
+                .setView(layout)
+                .setPositiveButton("Start Transmission", (dialog, which) -> {
+                    int modeIndex = spMode.getSelectedItemPosition();
+                    int channelIndex = spChannel.getSelectedItemPosition();
 
-                    if (AirSignalInCallService.getActiveCall() != null) {
-                        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-                        serviceIntent.setAction(AudioTransferService.ACTION_SEND_BINARY_FILE);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_PATH, localCachedFile.getAbsolutePath());
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
-                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_ID, fileId);
-                        requireContext().startService(serviceIntent);
-                        Toast.makeText(requireContext(), "Streaming into Active Call...", Toast.LENGTH_SHORT).show();
-                    } else {
-                        promptPhoneNumberAndPlaceCall(null, null, localCachedFile);
-                    }
-                    loadTransfers();
+                    ModulationManager.Mode selectedMode = (modeIndex == 0)
+                            ? ModulationManager.Mode.FSK
+                            : ModulationManager.Mode.GGWAVE;
+                    ModulationManager.getInstance(requireContext()).setMode(selectedMode);
+
+                    executeAudioTransmission(channelIndex);
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
     }
 
-    private void promptPhoneNumberAndPlaceCall(final byte[] tokenPayload, final File imageToTransmit, final File rawFileToTransmit) {
+    private void executeAudioTransmission(int channelIndex) {
+        String fileId = "TX_" + UUID.randomUUID().toString().substring(0, 8);
+        TransferItem item = new TransferItem(
+                fileId,
+                selectedFileName,
+                selectedFileSize,
+                0,
+                "TRANSMITTING",
+                ModulationManager.getInstance(requireContext()).getMode().name(),
+                1,
+                0
+        );
+        transferDb.insertTransfer(item);
+        loadTransfers();
+
+        Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
+        serviceIntent.setAction(AudioTransferService.ACTION_SEND_AUDIO_DATA);
+        if (localCachedFile != null && localCachedFile.exists()) {
+            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_PATH, localCachedFile.getAbsolutePath());
+        }
+        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
+        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
+        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_ID, fileId);
+
+        if (channelIndex == 0) {
+            // Stream to existing call
+            if (AirSignalInCallService.getActiveCall() != null) {
+                requireContext().startService(serviceIntent);
+                Toast.makeText(requireContext(), "Streaming audio into active call...", Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(requireContext(), "No active call found. Playing via local audio.", Toast.LENGTH_LONG).show();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    requireContext().startForegroundService(serviceIntent);
+                } else {
+                    requireContext().startService(serviceIntent);
+                }
+            }
+        } else if (channelIndex == 1) {
+            // Local speaker / Aux cable
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                requireContext().startForegroundService(serviceIntent);
+            } else {
+                requireContext().startService(serviceIntent);
+            }
+            Toast.makeText(requireContext(), "Playing transmission audio...", Toast.LENGTH_SHORT).show();
+        } else if (channelIndex == 2) {
+            // Dial phone number
+            promptPhoneNumberAndPlaceCall(null, localCachedFile);
+        }
+    }
+
+    private void promptPhoneNumberAndPlaceCall(final String rawText, final File fileToTransmit) {
         final EditText etPhone = new EditText(requireContext());
         etPhone.setHint("Enter Target Phone Number to Call");
-        etPhone.setPadding(32, 32, 32, 32);
+        etPhone.setPadding(dpToPx(20), dpToPx(16), dpToPx(20), dpToPx(16));
 
         new AlertDialog.Builder(requireContext())
-                .setTitle("Dial Audio Data Call")
-                .setMessage("Enter the recipient's phone number. AirSignal will place the cellular voice call and stream the data automatically once answered.")
+                .setTitle("Dial & Stream Audio")
+                .setMessage("Enter the recipient's phone number. AirSignal will place the call and transmit the audio once answered.")
                 .setView(etPhone)
                 .setPositiveButton("Call & Transmit", (dialog, which) -> {
                     String phone = etPhone.getText().toString().trim();
                     if (!phone.isEmpty()) {
+                        String fileId = "CALL_" + UUID.randomUUID().toString().substring(0, 8);
                         Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
-                        if (tokenPayload != null) {
-                            serviceIntent.setAction(AudioTransferService.ACTION_SEND_TOKEN);
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_TOKEN_PAYLOAD, tokenPayload);
-                        } else if (imageToTransmit != null) {
-                            serviceIntent.setAction(AudioTransferService.ACTION_SEND_PHONETIC_IMAGE);
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_IMAGE_PATH, imageToTransmit.getAbsolutePath());
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
-                        } else if (rawFileToTransmit != null) {
-                            serviceIntent.setAction(AudioTransferService.ACTION_SEND_BINARY_FILE);
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_PATH, rawFileToTransmit.getAbsolutePath());
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
-                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
+                        serviceIntent.setAction(AudioTransferService.ACTION_SEND_AUDIO_DATA);
+                        if (fileToTransmit != null) {
+                            serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_PATH, fileToTransmit.getAbsolutePath());
                         }
+                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_NAME, selectedFileName);
+                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, selectedFileSize);
+                        serviceIntent.putExtra(AudioTransferService.EXTRA_FILE_ID, fileId);
                         requireContext().startService(serviceIntent);
 
                         CallManager.placeCall(requireContext(), phone);
-                        Toast.makeText(requireContext(), "Dialing " + phone + ". Transmission will begin when answered.", Toast.LENGTH_LONG).show();
+                        Toast.makeText(requireContext(), "Dialing " + phone + "...", Toast.LENGTH_LONG).show();
                     } else {
                         Toast.makeText(requireContext(), "Please enter a valid phone number", Toast.LENGTH_SHORT).show();
                     }
@@ -553,7 +419,7 @@ public class TransferFragment extends Fragment {
     }
 
     private byte[] readFileBytes(File file) {
-        try (InputStream is = new java.io.FileInputStream(file);
+        try (InputStream is = new FileInputStream(file);
              ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
             byte[] buf = new byte[8192];
             int r;
@@ -567,41 +433,35 @@ public class TransferFragment extends Fragment {
         }
     }
 
-    private void simulateReceiverPopup() {
-        TemplateToken token = new TemplateToken(
-                TemplateToken.MODE_LOSSLESS_IMAGE_HEADER,
-                TemplateToken.CATEGORY_LOSSLESS_IMAGE,
-                TemplateCatalog.TEMPLATE_IMAGE_WEBP_LOSSLESS,
-                640,
-                480,
-                TemplateToken.ICON_IMAGE_CONTAINER,
-                TemplateToken.SEVERITY_LOW,
-                1420,
-                0
-        );
-        VisualRenderer.showVisualResultDialog(requireContext(), token);
-    }
-
     private void showSmsDataDialog() {
         final EditText etPhone = new EditText(requireContext());
         etPhone.setHint("Enter Target Phone Number");
-        etPhone.setPadding(32, 32, 32, 32);
+        etPhone.setPadding(dpToPx(20), dpToPx(16), dpToPx(20), dpToPx(16));
 
         new AlertDialog.Builder(requireContext())
                 .setTitle("Send via SMS Data Mode")
-                .setMessage("Data will be encoded into Base64 packet chunks and transmitted via Cellular SMS.")
+                .setMessage("Payload will be sliced into Base64 packet chunks and transmitted via Cellular SMS.")
                 .setView(etPhone)
                 .setPositiveButton("Start SMS Transfer", (dialog, which) -> {
                     String phone = etPhone.getText().toString().trim();
                     if (!phone.isEmpty()) {
                         byte[] payloadBytes = (localCachedFile != null && localCachedFile.exists())
                                 ? readFileBytes(localCachedFile)
-                                : "AirSignal Offline Data Packet Test Content 2026".getBytes();
+                                : "AirSignal Offline Data Packet Payload".getBytes(StandardCharsets.UTF_8);
 
                         List<DataPacket> packets = DataPacketManager.createPackets(payloadBytes);
                         String fileId = packets.isEmpty() ? "SYS_01" : packets.get(0).getFileId();
 
-                        TransferItem item = new TransferItem(fileId, selectedFileName.equals("None") ? "telemetry_log_2026.dat" : selectedFileName, payloadBytes.length, 100, "COMPLETED", "SMS_DATA", packets.size(), packets.size());
+                        TransferItem item = new TransferItem(
+                                fileId,
+                                selectedFileName.equals("None") ? "data_payload.bin" : selectedFileName,
+                                payloadBytes.length,
+                                100,
+                                "COMPLETED",
+                                "SMS_DATA",
+                                packets.size(),
+                                packets.size()
+                        );
                         transferDb.insertTransfer(item);
 
                         Intent serviceIntent = new Intent(requireContext(), SmsTransferService.class);
@@ -630,7 +490,16 @@ public class TransferFragment extends Fragment {
             String phone = etPhone.getText().toString().trim();
             if (!phone.isEmpty()) {
                 String fileId = "SYS_AUD_" + System.currentTimeMillis();
-                TransferItem item = new TransferItem(fileId, selectedFileName.equals("None") ? "stream_audio_data.bin" : selectedFileName, selectedFileSize > 0 ? selectedFileSize : 8192, 0, "QUEUED", "AUDIO_DATA", 16, 0);
+                TransferItem item = new TransferItem(
+                        fileId,
+                        selectedFileName.equals("None") ? "stream_audio_data.bin" : selectedFileName,
+                        selectedFileSize > 0 ? selectedFileSize : 8192,
+                        0,
+                        "QUEUED",
+                        ModulationManager.getInstance(requireContext()).getMode().name(),
+                        1,
+                        0
+                );
                 transferDb.insertTransfer(item);
 
                 Intent serviceIntent = new Intent(requireContext(), AudioTransferService.class);
@@ -645,7 +514,7 @@ public class TransferFragment extends Fragment {
 
                 CallManager.placeCall(requireContext(), phone);
 
-                Toast.makeText(requireContext(), "Dialing " + phone + ". Audio stream will start when answered.", Toast.LENGTH_LONG).show();
+                Toast.makeText(requireContext(), "Dialing " + phone + ". Audio will stream when answered.", Toast.LENGTH_LONG).show();
                 dialog.dismiss();
                 loadTransfers();
             }
