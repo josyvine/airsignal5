@@ -1,12 +1,11 @@
 package com.example.audio;
 
 import android.annotation.SuppressLint;
+import android.content.Context;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 
-import com.example.knowledge.PhoneticImageTransceiver;
-import com.example.models.TemplateToken;
 import com.example.utils.AirLogger;
 
 import java.io.ByteArrayOutputStream;
@@ -22,28 +21,28 @@ public class AudioReceiver {
     public static final byte SYNC_PREAMBLE = (byte) 0xAA;
     public static final byte START_FRAME_DELIMITER = (byte) 0x7E;
 
-    public static final int MAX_STREAM_BUFFER_SIZE = 32768; // 32 KB maximum image/file buffer
+    public static final int MAX_STREAM_BUFFER_SIZE = 65536; // 64 KB maximum buffer
 
-    // Standardized handshake command strings
+    // Handshake command strings
     public static final String CMD_ACTIVATE_RECEIVER = "AIR_CMD:ACTIVATE_RECEIVER";
     public static final String CMD_RECEIVER_READY = "AIR_ACK:RECEIVER_READY";
 
-    private int baudRate = 1200; // 300, 600, 1200, 2400
+    private int baudRate = 300; // 150, 300, 600, 1200, 2400
     private int activeSampleRate = DEFAULT_SAMPLE_RATE;
     private final AtomicBoolean isListening = new AtomicBoolean(false);
     private AudioRecord audioRecord;
     private AudioReceiverListener listener;
+    private Context context;
 
     public interface AudioReceiverListener {
         void onByteDecoded(byte b);
         void onFrameDecoded(byte[] frameData);
-        void onTokenDecoded(TemplateToken token);
+        void onPayloadDecoded(String payload);
         void onReceiverActivationCommand();
         void onReceiverReadyAckReceived();
         void onError(Exception e);
     }
 
-    // Legacy listener interface for backward compatibility
     public interface AudioDecoderListener {
         void onByteDecoded(byte b);
     }
@@ -59,7 +58,7 @@ public class AudioReceiver {
             public void onFrameDecoded(byte[] frameData) {}
 
             @Override
-            public void onTokenDecoded(TemplateToken token) {}
+            public void onPayloadDecoded(String payload) {}
 
             @Override
             public void onReceiverActivationCommand() {}
@@ -73,6 +72,11 @@ public class AudioReceiver {
     }
 
     public AudioReceiver(AudioReceiverListener listener) {
+        this.listener = listener;
+    }
+
+    public AudioReceiver(Context context, AudioReceiverListener listener) {
+        this.context = context;
         this.listener = listener;
     }
 
@@ -98,17 +102,16 @@ public class AudioReceiver {
     public void startListening() {
         if (isListening.get()) return;
 
-        // Hardware Compatibility Probe Matrix (Supports Huawei EMUI, ColorOS, and Standard Android)
+        // Hardware Compatibility Probe Matrix (Supports Samsung, Oppo/ColorOS, Xiaomi, Huawei)
         int[] sampleRates = new int[]{48000, 44100, 16000, 8000};
         
-        // Reordered to bypass Huawei's zero-energy privacy trap.
         int[] audioSources = new int[]{
-                MediaRecorder.AudioSource.MIC,                 // Best standard fallback (Oppo, Samsung, Huawei)
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION, // Designed specifically to bypass call muting
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION, // Best source to bypass active in-call muting
+                MediaRecorder.AudioSource.MIC,                 // Standard microphone
                 MediaRecorder.AudioSource.DEFAULT,
                 9,                                             // AudioSource.UNPROCESSED (Direct hardware ADC)
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,   // Heavily filtered on Huawei during calls (last resort)
-                MediaRecorder.AudioSource.CAMCORDER            // Secondary ambient mic
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.CAMCORDER
         };
 
         boolean initialized = false;
@@ -139,8 +142,8 @@ public class AudioReceiver {
                     if (audioRecord.getState() == AudioRecord.STATE_INITIALIZED) {
                         activeSampleRate = rate;
                         initialized = true;
-                        AirLogger.i(TAG, "AudioRecord successfully initialized with Source=" + sourceToString(source) +
-                                ", SampleRate=" + rate + " Hz, Baud=" + baudRate);
+                        AirLogger.i(TAG, "AudioRecord initialized: Source=" + sourceToString(source) +
+                                ", Rate=" + rate + " Hz, Baud=" + baudRate);
                         break;
                     } else {
                         audioRecord.release();
@@ -159,7 +162,7 @@ public class AudioReceiver {
         }
 
         if (!initialized || audioRecord == null) {
-            AirLogger.e(TAG, "AudioRecord failed to initialize across all hardware probe configurations.");
+            AirLogger.e(TAG, "AudioRecord failed to initialize across all hardware configurations.");
             if (listener != null) {
                 listener.onError(new IllegalStateException("Microphone hardware probe failed across all sample rates."));
             }
@@ -169,7 +172,7 @@ public class AudioReceiver {
         try {
             isListening.set(true);
             audioRecord.startRecording();
-            AirLogger.i(TAG, "AudioReceiver recording started actively.");
+            AirLogger.i(TAG, "AudioReceiver recording active.");
             new Thread(this::listenLoop).start();
         } catch (Exception e) {
             AirLogger.e(TAG, "Failed starting AudioRecord stream", e);
@@ -179,6 +182,7 @@ public class AudioReceiver {
     }
 
     private double calculateRmsEnergy(short[] buffer, int readSize) {
+        if (readSize <= 0) return 0;
         double sum = 0;
         for (int i = 0; i < readSize; i++) {
             sum += buffer[i] * buffer[i];
@@ -187,7 +191,7 @@ public class AudioReceiver {
     }
 
     private void listenLoop() {
-        // Initialize the native DSP engine for the active hardware sampling rate
+        // Initialize native GGWave DSP engine
         GGWaveEngine ggwaveEngine = GGWaveEngine.getInstance();
         boolean ggwaveReady = ggwaveEngine.init(activeSampleRate);
 
@@ -196,7 +200,6 @@ public class AudioReceiver {
 
         double samplesPerBit = (double) activeSampleRate / (double) baudRate;
         int bitSampleLen = Math.max((int) Math.round(samplesPerBit), 1);
-        short[] bitBuffer = new short[bitSampleLen];
 
         int currentByteAccumulator = 0;
         int bitCount = 0;
@@ -205,10 +208,7 @@ public class AudioReceiver {
 
         // Frame Detection State Machine
         boolean isLockedOnPreamble = false;
-        boolean isAccumulatingImage = false;
         ByteArrayOutputStream frameBuffer = new ByteArrayOutputStream();
-
-        // Rolling sliding window for cellular carrier and local air-gap discovery
         StringBuilder slidingWindow = new StringBuilder();
 
         while (isListening.get()) {
@@ -218,40 +218,39 @@ public class AudioReceiver {
 
             int read = audioRecord.read(pcmBuffer, 0, pcmBuffer.length);
             if (read > 0) {
-                // 1. Primary DSP Path: Feed raw PCM audio frames directly to GGWave native demodulator
+                // 1. Primary DSP Path: GGWave native demodulator
                 if (ggwaveReady) {
                     byte[] decodedPayload = ggwaveEngine.decode(pcmBuffer, read);
                     if (decodedPayload != null && decodedPayload.length > 0) {
-                        AirLogger.i(TAG, "GGWave native decoder received valid error-corrected packet (" + decodedPayload.length + " bytes)");
+                        AirLogger.i(TAG, "GGWave native decoder received packet (" + decodedPayload.length + " bytes)");
                         handleDecodedPayload(decodedPayload);
                     }
                 }
 
-                // Diagnostic check to verify non-zero PCM energy
+                // Diagnostic check for zero-energy in-call privacy muting
                 double currentRms = calculateRmsEnergy(pcmBuffer, read);
                 if (currentRms == 0.0) {
                     consecutiveZeroEnergyCount++;
                     if (consecutiveZeroEnergyCount % 100 == 1) {
-                        AirLogger.w(TAG, "DIAGNOSTIC WARNING: Zero-energy PCM buffer detected (" 
-                                + consecutiveZeroEnergyCount + " consecutive frames). Operating system call privacy filters may be silencing the microphone input.");
+                        AirLogger.w(TAG, "DIAGNOSTIC: Zero-energy PCM buffer detected (" 
+                                + consecutiveZeroEnergyCount + " frames). Audio source may be muted by OS call privacy filters.");
                     }
                 } else {
                     consecutiveZeroEnergyCount = 0;
                 }
 
-                // 2. Secondary/Fallback DSP Path: Continuous bit detection loop for FSK/Handshakes
-                int bitVal = AudioDecoder.detectBit(pcmBuffer, 0, Math.min(read, bitSampleLen), activeSampleRate);
+                // 2. Secondary / FSK DSP Path: Goertzel bit discriminator
+                int bitVal = AudioDecoder.detectBit(pcmBuffer, 0, Math.min(read, bitSampleLen), activeSampleRate, baudRate);
 
                 if (bitVal == -1) {
                     consecutiveSilenceCount++;
 
-                    // If a stream chunk was accumulating and silence interval is reached, deliver the complete frame
-                    if (isLockedOnPreamble && frameBuffer.size() > 10 && consecutiveSilenceCount > 30) {
+                    // Deliver accumulated frame on silence interval
+                    if (isLockedOnPreamble && frameBuffer.size() > 4 && consecutiveSilenceCount > 25) {
                         byte[] completedFrame = frameBuffer.toByteArray();
-                        AirLogger.i(TAG, "FSK Fallback frame delivered via silence interval (" + completedFrame.length + " bytes).");
+                        AirLogger.i(TAG, "FSK frame delivered via silence interval (" + completedFrame.length + " bytes).");
                         handleDecodedPayload(completedFrame);
                         isLockedOnPreamble = false;
-                        isAccumulatingImage = false;
                         consecutiveSilenceCount = 0;
                         frameBuffer.reset();
                         slidingWindow.setLength(0);
@@ -279,9 +278,9 @@ public class AudioReceiver {
                     slidingWindow.append(c);
                     String currentWindowStr = slidingWindow.toString();
 
-                    // 1. Check for remote RECEIVER_READY ACK (Sender side)
-                    if (!isAccumulatingImage && currentWindowStr.contains(CMD_RECEIVER_READY)) {
-                        AirLogger.i(TAG, "Acoustic AIR_ACK:RECEIVER_READY detected! Remote receiver answered and listening.");
+                    // Check for remote Handshake ACK
+                    if (currentWindowStr.contains(CMD_RECEIVER_READY)) {
+                        AirLogger.i(TAG, "Acoustic AIR_ACK:RECEIVER_READY detected!");
                         if (listener != null) {
                             listener.onReceiverReadyAckReceived();
                         }
@@ -291,8 +290,8 @@ public class AudioReceiver {
                         continue;
                     }
 
-                    // 2. Check for remote ACTIVATE_RECEIVER acoustic handshake command (Receiver side)
-                    if (!isAccumulatingImage && currentWindowStr.contains(CMD_ACTIVATE_RECEIVER)) {
+                    // Check for remote Handshake Command
+                    if (currentWindowStr.contains(CMD_ACTIVATE_RECEIVER)) {
                         AirLogger.i(TAG, "Remote ACTIVATE_RECEIVER command detected!");
                         if (listener != null) {
                             listener.onReceiverActivationCommand();
@@ -303,35 +302,17 @@ public class AudioReceiver {
                         continue;
                     }
 
-                    // 3. Direct Sliding Lock for Sequenced Chunks or Legacy Streams
-                    if (!isAccumulatingImage && (currentWindowStr.contains(PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE) || currentWindowStr.contains(PhoneticImageTransceiver.CHUNK_PREAMBLE))) {
-                        AirLogger.i(TAG, "Image packet preamble detected via FSK sliding window! Locking stream.");
-                        isLockedOnPreamble = true;
-                        isAccumulatingImage = true;
-                        frameBuffer.reset();
-                        
-                        String matchedPreamble = currentWindowStr.contains(PhoneticImageTransceiver.CHUNK_PREAMBLE) ? 
-                                PhoneticImageTransceiver.CHUNK_PREAMBLE : PhoneticImageTransceiver.PHONETIC_IMG_PREAMBLE;
-                        
-                        byte[] preambleBytes = matchedPreamble.getBytes(StandardCharsets.UTF_8);
-                        frameBuffer.write(preambleBytes, 0, preambleBytes.length);
-                        slidingWindow.setLength(0);
-                        continue;
-                    }
-
-                    // 4. Standard 0x7E delimiter lock fallback
+                    // Standard 0x7E delimiter lock
                     if (!isLockedOnPreamble) {
                         if (completedByte == START_FRAME_DELIMITER) {
                             isLockedOnPreamble = true;
-                            isAccumulatingImage = false;
                             frameBuffer.reset();
                         }
                     } else {
-                        // If we are locked and hit another 0x7E delimiter, it signifies the end of a chunk
                         if (completedByte == START_FRAME_DELIMITER) {
-                            if (frameBuffer.size() > 10) {
+                            if (frameBuffer.size() > 4) {
                                 byte[] completedFrame = frameBuffer.toByteArray();
-                                AirLogger.i(TAG, "FSK Fallback frame delivered via frame delimiter (" + completedFrame.length + " bytes).");
+                                AirLogger.i(TAG, "FSK frame delivered via frame delimiter (" + completedFrame.length + " bytes).");
                                 handleDecodedPayload(completedFrame);
                             }
                             frameBuffer.reset();
@@ -343,15 +324,12 @@ public class AudioReceiver {
             }
         }
 
-        // Flush remaining frame if stream ended
-        if (frameBuffer.size() > 10) {
+        // Flush remaining buffer
+        if (frameBuffer.size() > 4) {
             handleDecodedPayload(frameBuffer.toByteArray());
         }
     }
 
-    /**
-     * Safely routes fully extracted packets to the application layer.
-     */
     private void handleDecodedPayload(byte[] payload) {
         if (payload == null || payload.length == 0) return;
 
@@ -369,18 +347,17 @@ public class AudioReceiver {
             return;
         }
 
-        if (payload.length == TemplateToken.TOKEN_BYTE_SIZE) {
-            TemplateToken token = TemplateToken.fromByteArray(payload);
-            if (token != null && token.isValid()) {
-                AirLogger.i(TAG, "Decoded TemplateToken! ID=" + token.getTemplateId());
+        // Attempt ModulationManager unpack (checks sync byte 0x7E, CRC-16, and GZIP decompression)
+        if (context != null) {
+            String unpackedText = ModulationManager.getInstance(context).unpackPayload(payload);
+            if (unpackedText != null && !unpackedText.isEmpty()) {
+                AirLogger.i(TAG, "Successfully unpacked payload via ModulationManager (" + unpackedText.length() + " chars)");
                 if (listener != null) {
-                    listener.onTokenDecoded(token);
+                    listener.onPayloadDecoded(unpackedText);
                 }
-                return;
             }
         }
 
-        // Passes the packet directly to the Activity/Service, which routes it into PhoneticImageTransceiver
         if (listener != null) {
             listener.onFrameDecoded(payload);
         }
