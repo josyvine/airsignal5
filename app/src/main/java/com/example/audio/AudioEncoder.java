@@ -3,10 +3,7 @@ package com.example.audio;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
-import android.telecom.Call;
 
-import com.example.knowledge.PhoneticImageTransceiver;
-import com.example.models.TemplateToken;
 import com.example.services.AirSignalInCallService;
 import com.example.utils.AirLogger;
 
@@ -21,17 +18,24 @@ public class AudioEncoder {
 
     public static final int SAMPLE_RATE = 48000;
     public static final int FALLBACK_SAMPLE_RATE = 44100;
-    public static final int MARK_FREQ = 1200;   // Bit 1 (Hz)
-    public static final int SPACE_FREQ = 2200;  // Bit 0 (Hz)
+
+    // Bell 202 Frequencies (1200 Baud)
+    public static final int BELL202_MARK_FREQ = 1200;   // Bit 1 (Hz)
+    public static final int BELL202_SPACE_FREQ = 2200;  // Bit 0 (Hz)
+
+    // Bell 103 Frequencies (300 Baud - Telecom / Cellular Voice Call Standard)
+    public static final int BELL103_MARK_FREQ = 1270;   // Bit 1 (Hz)
+    public static final int BELL103_SPACE_FREQ = 1070;  // Bit 0 (Hz)
 
     public static final byte SYNC_PREAMBLE = (byte) 0xAA;
     public static final byte START_FRAME_DELIMITER = (byte) 0x7E;
 
-    // Standardized handshake command strings for automated two-way connection synchronization
+    // Handshake command strings for automated synchronization
     public static final String CMD_ACTIVATE_RECEIVER = "AIR_CMD:ACTIVATE_RECEIVER";
     public static final String CMD_RECEIVER_READY = "AIR_ACK:RECEIVER_READY";
 
-    private int baudRate = 1200; // 300, 600, 1200, 2400
+    private int baudRate = 300; // 150, 300, 600, 1200, 2400
+    private ModulationManager.Mode modulationMode = ModulationManager.Mode.FSK;
     private final AtomicBoolean isTransmitting = new AtomicBoolean(false);
     private AudioTrack activeAudioTrack;
 
@@ -45,9 +49,14 @@ public class AudioEncoder {
         setBaudRate(baudRate);
     }
 
+    public AudioEncoder(int baudRate, ModulationManager.Mode mode) {
+        setBaudRate(baudRate);
+        this.modulationMode = mode;
+    }
+
     public void setBaudRate(int baudRate) {
         if (baudRate <= 0) {
-            this.baudRate = 1200;
+            this.baudRate = 300;
         } else {
             this.baudRate = baudRate;
         }
@@ -55,6 +64,14 @@ public class AudioEncoder {
 
     public int getBaudRate() {
         return baudRate;
+    }
+
+    public void setModulationMode(ModulationManager.Mode mode) {
+        this.modulationMode = mode;
+    }
+
+    public ModulationManager.Mode getModulationMode() {
+        return modulationMode;
     }
 
     public boolean isTransmitting() {
@@ -77,7 +94,7 @@ public class AudioEncoder {
     }
 
     /**
-     * Receiver-side Automation: Transmits the acoustic handshake acknowledgment to announce call answer.
+     * Receiver-side Automation: Transmits acoustic handshake acknowledgment.
      */
     public void transmitReceiverReadyAck(final OnTransmissionProgressListener listener) {
         AirLogger.i(TAG, "Transmitting receiver ready acoustic acknowledgment (AIR_ACK:RECEIVER_READY)...");
@@ -86,7 +103,7 @@ public class AudioEncoder {
     }
 
     /**
-     * Transmitter-side Command: Transmits the ACTIVATE_RECEIVER acoustic handshake command over the call.
+     * Transmitter-side Command: Transmits ACTIVATE_RECEIVER command.
      */
     public void transmitActivationCommand(final OnTransmissionProgressListener listener) {
         AirLogger.i(TAG, "Transmitting remote ACTIVATE_RECEIVER acoustic command...");
@@ -94,49 +111,18 @@ public class AudioEncoder {
         transmitDataOverAudio(commandBytes, listener);
     }
 
-    /**
-     * Transmits a single raw byte payload asynchronously.
-     */
     public void transmitDataOverAudio(byte[] data) {
-        transmitDataOverAudio(data, null);
+        transmitDataOverAudio(data, modulationMode, null);
+    }
+
+    public void transmitDataOverAudio(byte[] data, OnTransmissionProgressListener listener) {
+        transmitDataOverAudio(data, modulationMode, listener);
     }
 
     /**
-     * Core synchronous execution for encoding and playing acoustic data.
-     * This blocks the calling thread until the audio finishes playing.
+     * Transmits a single payload asynchronously using the specified modulation mode.
      */
-    private void executeTransmissionSync(byte[] data, OnTransmissionProgressListener listener) throws Exception {
-        AirLogger.i(TAG, "Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
-
-        GGWaveEngine engine = GGWaveEngine.getInstance();
-        boolean initialized = engine.init(SAMPLE_RATE);
-        short[] pcmSamples = null;
-
-        if (initialized) {
-            // PROTOCOL_AUDIBLE_NORMAL is specifically designed to survive active cellular voice calls
-            pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_NORMAL, 80);
-        }
-
-        // Fallback to internal continuous-phase FSK if native engine is unavailable
-        if (pcmSamples == null || pcmSamples.length == 0) {
-            AirLogger.w(TAG, "GGWave encoding returned empty. Falling back to internal continuous-phase FSK synthesizer.");
-            byte[] framedData = applyFrameEncapsulation(data);
-            pcmSamples = generateContinuousPhaseFsk(framedData, baudRate);
-            playPcmTrack(pcmSamples, FALLBACK_SAMPLE_RATE);
-        } else {
-            playPcmTrack(pcmSamples, SAMPLE_RATE);
-        }
-
-        if (listener != null) {
-            listener.onProgress(1, 1, 100);
-            listener.onComplete();
-        }
-    }
-
-    /**
-     * Transmits a single payload over the speaker asynchronously.
-     */
-    public void transmitDataOverAudio(final byte[] data, final OnTransmissionProgressListener listener) {
+    public void transmitDataOverAudio(final byte[] data, final ModulationManager.Mode mode, final OnTransmissionProgressListener listener) {
         if (data == null || data.length == 0) {
             if (listener != null) listener.onError(new IllegalArgumentException("Data payload is empty"));
             return;
@@ -145,7 +131,7 @@ public class AudioEncoder {
         new Thread(() -> {
             isTransmitting.set(true);
             try {
-                executeTransmissionSync(data, listener);
+                executeTransmissionSync(data, mode, listener);
             } catch (Exception e) {
                 AirLogger.e(TAG, "Transmission failed", e);
                 if (listener != null) listener.onError(e);
@@ -156,34 +142,47 @@ public class AudioEncoder {
     }
 
     /**
-     * Mode 4: Transmits a 16-byte TemplateToken as an ultra-fast sub-second audio burst.
+     * Core synchronous execution for encoding and playing acoustic data.
      */
-    public void transmitPhoneticToken(final TemplateToken token, final OnTransmissionProgressListener listener) {
-        if (token == null) {
-            if (listener != null) listener.onError(new IllegalArgumentException("TemplateToken is null"));
-            return;
+    private void executeTransmissionSync(byte[] data, ModulationManager.Mode mode, OnTransmissionProgressListener listener) throws Exception {
+        short[] pcmSamples = null;
+        int targetSampleRate = SAMPLE_RATE;
+
+        if (mode == ModulationManager.Mode.GGWAVE) {
+            AirLogger.i(TAG, "Generating GGWave DSP acoustic waveform (" + data.length + " bytes)...");
+            GGWaveEngine engine = GGWaveEngine.getInstance();
+            boolean initialized = engine.init(SAMPLE_RATE);
+
+            if (initialized) {
+                // AUDIBLE_NORMAL provides high resilience over cellular voice calls
+                pcmSamples = engine.encode(data, GGWaveEngine.PROTOCOL_AUDIBLE_NORMAL, 85);
+            }
         }
-        byte[] tokenBytes = token.toByteArray();
-        transmitDataOverAudio(tokenBytes, listener);
+
+        // Generate Continuous-Phase FSK if in FSK mode or if GGWave returned empty
+        if (pcmSamples == null || pcmSamples.length == 0) {
+            AirLogger.i(TAG, "Generating Continuous-Phase FSK waveform (" + data.length + " bytes @ " + baudRate + " baud)...");
+            byte[] framedData = applyFrameEncapsulation(data);
+            pcmSamples = generateContinuousPhaseFsk(framedData, baudRate, SAMPLE_RATE);
+            targetSampleRate = SAMPLE_RATE;
+        }
+
+        playPcmTrack(pcmSamples, targetSampleRate);
+
+        if (listener != null) {
+            listener.onProgress(1, 1, 100);
+            listener.onComplete();
+        }
     }
 
     /**
-     * Dedicated Feature: Transmits a list of Phonetic Base64 Dictionary words as a structured sequence.
-     */
-    public void transmitPhoneticBase64Sequence(final List<String> phoneticWords, final OnTransmissionProgressListener listener) {
-        if (phoneticWords == null || phoneticWords.isEmpty()) {
-            if (listener != null) listener.onError(new IllegalArgumentException("Phonetic words list is empty"));
-            return;
-        }
-        byte[] payload = PhoneticImageTransceiver.formatTokensForTransmission(phoneticWords);
-        transmitDataOverAudio(payload, listener);
-    }
-
-    /**
-     * Mode 2: Streams a multi-packet raw binary dataset incrementally.
-     * Uses a single background thread to process chunks sequentially, preventing thread explosions.
+     * Streams multi-packet raw binary dataset incrementally.
      */
     public void transmitRawStream(final List<byte[]> packets, final OnTransmissionProgressListener listener) {
+        transmitRawStream(packets, modulationMode, listener);
+    }
+
+    public void transmitRawStream(final List<byte[]> packets, final ModulationManager.Mode mode, final OnTransmissionProgressListener listener) {
         if (packets == null || packets.isEmpty()) {
             if (listener != null) listener.onError(new IllegalArgumentException("Packet list is empty"));
             return;
@@ -198,17 +197,15 @@ public class AudioEncoder {
                     if (!isTransmitting.get()) break;
 
                     byte[] packetData = packets.get(i);
-                    
-                    // Execute synchronously so we don't spawn 100+ threads simultaneously
-                    executeTransmissionSync(packetData, null);
+                    executeTransmissionSync(packetData, mode, null);
 
                     int progressPercent = (int) (((i + 1) / (float) totalPackets) * 100);
                     if (listener != null) {
                         listener.onProgress(i + 1, totalPackets, progressPercent);
                     }
 
-                    // Add a brief acoustic silence gap between chunks to allow the receiver's DSP to finalize the frame
-                    Thread.sleep(200); 
+                    // Acoustic guard interval to allow receiver DSP to finalize frame
+                    Thread.sleep(150);
                 }
 
                 if (isTransmitting.get() && listener != null) {
@@ -224,7 +221,7 @@ public class AudioEncoder {
     }
 
     /**
-     * Prepends sync bytes (0xAA 0xAA 0xAA 0x7E) for receiver preamble detection.
+     * Prepends sync bytes (0xAA 0xAA 0xAA 0x7E) for receiver preamble synchronization.
      */
     private byte[] applyFrameEncapsulation(byte[] payload) {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -240,12 +237,16 @@ public class AudioEncoder {
     }
 
     /**
-     * Sample-accurate, continuous-phase FSK modulator.
+     * Sample-accurate, continuous-phase FSK modulator with smooth envelope shaping.
      */
-    public static short[] generateContinuousPhaseFsk(byte[] data, int baud) {
+    public static short[] generateContinuousPhaseFsk(byte[] data, int baud, int sampleRate) {
         if (data == null || data.length == 0) return new short[0];
 
-        double samplesPerBit = (double) FALLBACK_SAMPLE_RATE / (double) baud;
+        // Select frequency pair based on baud rate
+        int markFreq = (baud <= 600) ? BELL103_MARK_FREQ : BELL202_MARK_FREQ;
+        int spaceFreq = (baud <= 600) ? BELL103_SPACE_FREQ : BELL202_SPACE_FREQ;
+
+        double samplesPerBit = (double) sampleRate / (double) baud;
         int totalBits = data.length * 8;
         int totalSamples = (int) Math.round(totalBits * samplesPerBit);
 
@@ -253,14 +254,29 @@ public class AudioEncoder {
         double currentPhase = 0.0;
         int sampleIndex = 0;
 
+        // 3ms cosine envelope fade length to eliminate click harmonics
+        int fadeLen = Math.min((int) (sampleRate * 0.003), (int) samplesPerBit / 2);
+
         for (byte b : data) {
             for (int bit = 7; bit >= 0; bit--) {
                 int bitVal = (b >>> bit) & 1;
-                double targetFreq = (bitVal == 1) ? MARK_FREQ : SPACE_FREQ;
-                double phaseIncrement = (2.0 * Math.PI * targetFreq) / FALLBACK_SAMPLE_RATE;
+                double targetFreq = (bitVal == 1) ? markFreq : spaceFreq;
+                double phaseIncrement = (2.0 * Math.PI * targetFreq) / sampleRate;
 
-                for (int s = 0; s < samplesPerBit && sampleIndex < totalSamples; s++) {
-                    output[sampleIndex++] = (short) (Math.sin(currentPhase) * 32767.0);
+                int bitStartSample = sampleIndex;
+                int bitLengthSamples = (int) Math.round(samplesPerBit);
+
+                for (int s = 0; s < bitLengthSamples && sampleIndex < totalSamples; s++) {
+                    double sampleVal = Math.sin(currentPhase);
+
+                    // Apply soft-edge fade at overall stream boundaries
+                    if (sampleIndex < fadeLen) {
+                        sampleVal *= ((double) sampleIndex / (double) fadeLen);
+                    } else if (sampleIndex > totalSamples - fadeLen) {
+                        sampleVal *= ((double) (totalSamples - sampleIndex) / (double) fadeLen);
+                    }
+
+                    output[sampleIndex++] = (short) (sampleVal * 32767.0 * 0.75); // 75% volume prevents DAC clipping
                     currentPhase += phaseIncrement;
                     if (currentPhase >= 2.0 * Math.PI) {
                         currentPhase -= 2.0 * Math.PI;
@@ -271,31 +287,30 @@ public class AudioEncoder {
         return output;
     }
 
-    private void playPcmTrack(short[] pcmSamples) {
-        playPcmTrack(pcmSamples, SAMPLE_RATE);
-    }
-
     private void playPcmTrack(short[] pcmSamples, int sampleRate) {
+        if (pcmSamples == null || pcmSamples.length == 0) return;
+
         byte[] pcmBytes = convertShortsToBytes(pcmSamples);
 
+        // USAGE_VOICE_COMMUNICATION ensures routing into active cellular calls without OS mute
         activeAudioTrack = new AudioTrack.Builder()
-                        .setAudioAttributes(new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build())
-                        .setAudioFormat(new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .setSampleRate(sampleRate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .build())
-                        .setBufferSizeInBytes(pcmBytes.length)
-                        .setTransferMode(AudioTrack.MODE_STATIC)
-                        .build();
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setBufferSizeInBytes(pcmBytes.length)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build();
 
         activeAudioTrack.write(pcmBytes, 0, pcmBytes.length);
         activeAudioTrack.play();
 
-        long durationMs = (long) (((double) pcmSamples.length / (double) sampleRate) * 1000.0) + 100;
+        long durationMs = (long) (((double) pcmSamples.length / (double) sampleRate) * 1000.0) + 120;
         try {
             Thread.sleep(durationMs);
         } catch (InterruptedException ignored) {
@@ -310,7 +325,7 @@ public class AudioEncoder {
         }
     }
 
-    private byte[] convertShortsToBytes(short[] shorts) {
+    private static byte[] convertShortsToBytes(short[] shorts) {
         byte[] bytes = new byte[shorts.length * 2];
         for (int i = 0; i < shorts.length; i++) {
             bytes[i * 2] = (byte) (shorts[i] & 0xFF);
