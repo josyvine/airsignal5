@@ -1,24 +1,29 @@
 package com.example.audio;
 
-import com.example.models.TemplateToken;
 import com.example.utils.AirLogger;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class AudioDecoder {
 
     private static final String TAG = "AudioDecoder";
 
-    public static final int MARK_FREQ = 1200;   // Bit 1 (Hz)
-    public static final int SPACE_FREQ = 2200;  // Bit 0 (Hz)
+    // Bell 202 Frequencies (1200+ Baud)
+    public static final int BELL202_MARK_FREQ = 1200;   // Bit 1 (Hz)
+    public static final int BELL202_SPACE_FREQ = 2200;  // Bit 0 (Hz)
+
+    // Bell 103 Frequencies (300 Baud - Telecom Standard)
+    public static final int BELL103_MARK_FREQ = 1270;   // Bit 1 (Hz)
+    public static final int BELL103_SPACE_FREQ = 1070;  // Bit 0 (Hz)
 
     public static final byte SYNC_PREAMBLE = (byte) 0xAA;
     public static final byte START_FRAME_DELIMITER = (byte) 0x7E;
 
     // Minimum RMS energy threshold to distinguish in-call signal from silence
-    private static final double MIN_ENERGY_THRESHOLD = 300.0;
+    private static final double MIN_ENERGY_THRESHOLD = 250.0;
 
     // Standard In-Call Telephony Dual-Frequency Grid (Hz)
     public static final int[] DTMF_ROW_FREQS = new int[]{697, 770, 852, 941};
@@ -68,7 +73,7 @@ public class AudioDecoder {
         }
 
         // Validate frequency power ratio
-        if (bestRow != -1 && bestCol != -1 && maxRowPower > 5000.0 && maxColPower > 5000.0) {
+        if (bestRow != -1 && bestCol != -1 && maxRowPower > 4000.0 && maxColPower > 4000.0) {
             return DTMF_MATRIX[bestRow][bestCol];
         }
 
@@ -109,19 +114,11 @@ public class AudioDecoder {
     }
 
     /**
-     * Legacy backward-compatible bit detector.
+     * Sub-array bit detector for continuous-phase FSK using Goertzel power discrimination.
      */
-    public static int detectBit(short[] pcmBuffer, int sampleRate) {
-        if (pcmBuffer == null || pcmBuffer.length == 0) return 0;
-        return detectBit(pcmBuffer, 0, pcmBuffer.length, sampleRate);
-    }
-
-    /**
-     * High-speed sub-array bit detector avoiding memory allocation.
-     */
-    public static int detectBit(short[] pcm, int offset, int length, int sampleRate) {
+    public static int detectBit(short[] pcm, int offset, int length, int sampleRate, int baudRate) {
         if (pcm == null || length <= 0 || offset + length > pcm.length) {
-            return 0;
+            return -1;
         }
 
         double totalEnergy = calculateRmsEnergy(pcm, offset, length);
@@ -129,32 +126,41 @@ public class AudioDecoder {
             return -1; // Silence or background noise
         }
 
-        double markPower = calculateGoertzelPower(pcm, offset, length, MARK_FREQ, sampleRate);
-        double spacePower = calculateGoertzelPower(pcm, offset, length, SPACE_FREQ, sampleRate);
+        int markFreq = (baudRate <= 600) ? BELL103_MARK_FREQ : BELL202_MARK_FREQ;
+        int spaceFreq = (baudRate <= 600) ? BELL103_SPACE_FREQ : BELL202_SPACE_FREQ;
+
+        double markPower = calculateGoertzelPower(pcm, offset, length, markFreq, sampleRate);
+        double spacePower = calculateGoertzelPower(pcm, offset, length, spaceFreq, sampleRate);
 
         return (markPower > spacePower) ? 1 : 0;
     }
 
-    /**
-     * Demodulates a continuous PCM audio buffer into a list of raw data bytes.
-     * Checks GGWave native MFSK demodulator first, then falls back to Goertzel bitstream extraction.
-     */
     public static byte[] decodeFrameFromPcm(short[] pcmStream, int sampleRate, int baudRate) {
+        return decodeFrameFromPcm(pcmStream, sampleRate, baudRate, ModulationManager.Mode.FSK);
+    }
+
+    /**
+     * Demodulates a continuous PCM audio buffer into raw data bytes.
+     * Routes through GGWave if specified, or decodes via Goertzel FSK bitstream extraction.
+     */
+    public static byte[] decodeFrameFromPcm(short[] pcmStream, int sampleRate, int baudRate, ModulationManager.Mode mode) {
         if (pcmStream == null || pcmStream.length == 0 || baudRate <= 0) {
             return new byte[0];
         }
 
         // Primary DSP Path: GGWave native decoding
-        GGWaveEngine engine = GGWaveEngine.getInstance();
-        if (engine.init(sampleRate)) {
-            byte[] nativeDecoded = engine.decode(pcmStream, pcmStream.length);
-            if (nativeDecoded != null && nativeDecoded.length > 0) {
-                AirLogger.i(TAG, "decodeFrameFromPcm: GGWave successfully decoded " + nativeDecoded.length + " bytes.");
-                return nativeDecoded;
+        if (mode == ModulationManager.Mode.GGWAVE) {
+            GGWaveEngine engine = GGWaveEngine.getInstance();
+            if (engine.init(sampleRate)) {
+                byte[] nativeDecoded = engine.decode(pcmStream, pcmStream.length);
+                if (nativeDecoded != null && nativeDecoded.length > 0) {
+                    AirLogger.i(TAG, "decodeFrameFromPcm: GGWave successfully decoded " + nativeDecoded.length + " bytes.");
+                    return nativeDecoded;
+                }
             }
         }
 
-        // Secondary/Fallback DSP Path: FSK bit-slicing
+        // Secondary / FSK DSP Path: Goertzel bit-slicing
         double samplesPerBit = (double) sampleRate / (double) baudRate;
         int totalBits = (int) (pcmStream.length / samplesPerBit);
 
@@ -167,7 +173,7 @@ public class AudioDecoder {
             int len = (int) Math.round((b + 1) * samplesPerBit) - offset;
 
             if (offset + len <= pcmStream.length) {
-                int bitVal = detectBit(pcmStream, offset, len, sampleRate);
+                int bitVal = detectBit(pcmStream, offset, len, sampleRate, baudRate);
                 if (bitVal != -1) {
                     rawBits.add(bitVal);
                 } else {
@@ -197,33 +203,9 @@ public class AudioDecoder {
     }
 
     /**
-     * Mode 4: Directly extracts and validates a 16-byte TemplateToken from raw PCM audio.
-     */
-    public static TemplateToken decodeTokenFromPcm(short[] pcmStream, int sampleRate, int baudRate) {
-        byte[] payload = decodeFrameFromPcm(pcmStream, sampleRate, baudRate);
-        if (payload == null || payload.length < TemplateToken.TOKEN_BYTE_SIZE) {
-            return null;
-        }
-
-        // Locate valid 16-byte token slice with matching CRC16
-        for (int i = 0; i <= payload.length - TemplateToken.TOKEN_BYTE_SIZE; i++) {
-            byte[] candidate = new byte[TemplateToken.TOKEN_BYTE_SIZE];
-            System.arraycopy(payload, i, candidate, 0, TemplateToken.TOKEN_BYTE_SIZE);
-
-            TemplateToken token = TemplateToken.fromByteArray(candidate);
-            if (token != null && token.isValid()) {
-                AirLogger.i(TAG, "Successfully demodulated valid TemplateToken ID=" + token.getTemplateId());
-                return token;
-            }
-        }
-
-        return null;
-    }
-
-    /**
      * Hunts for sync preamble (0xAA 0xAA 0xAA 0x7E) and extracts the enclosed payload.
      */
-    private static byte[] extractPayloadFromFramedBytes(byte[] rawBytes) {
+    public static byte[] extractPayloadFromFramedBytes(byte[] rawBytes) {
         if (rawBytes == null || rawBytes.length < 4) {
             return rawBytes != null ? rawBytes : new byte[0];
         }
