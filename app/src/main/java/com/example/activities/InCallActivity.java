@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.Typeface;
 import android.media.AudioManager;
 import android.media.MediaRecorder;
 import android.media.ToneGenerator;
@@ -23,6 +24,8 @@ import android.provider.OpenableColumns;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -35,12 +38,9 @@ import androidx.core.content.ContextCompat;
 
 import com.example.R;
 import com.example.audio.AudioEncoder;
+import com.example.audio.ModulationManager;
 import com.example.database.DatabaseHelper;
-import com.example.knowledge.PhoneticImageTransceiver;
-import com.example.knowledge.PhoneticTokenManager;
-import com.example.knowledge.TemplateCatalog;
 import com.example.models.CallLogItem;
-import com.example.models.TemplateToken;
 import com.example.services.AirSignalInCallService;
 import com.example.services.AudioTransferService;
 import com.example.utils.AirLogger;
@@ -50,8 +50,10 @@ import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 
 public class InCallActivity extends AppCompatActivity {
 
@@ -80,7 +82,7 @@ public class InCallActivity extends AppCompatActivity {
 
     private String phoneNumber = "";
     private String contactName = "";
-    private boolean isIncomingCall = false; // Flag to identify if we are the sender or receiver
+    private boolean isIncomingCall = false;
 
     private AudioManager audioManager;
     private ToneGenerator toneGenerator;
@@ -105,7 +107,7 @@ public class InCallActivity extends AppCompatActivity {
 
     private ActivityResultLauncher<String> inCallFilePickerLauncher;
 
-    // Real-time broadcast receiver for in-call data reception & activation events
+    // Broadcast receiver for in-call data reception and progress updates
     private final BroadcastReceiver inCallDataReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -121,7 +123,7 @@ public class InCallActivity extends AppCompatActivity {
                     tvRecordingBadge.setVisibility(View.VISIBLE);
                     tvRecordingBadge.setText("⚡ RECEIVING IN-CALL DATA...");
                     tvRecordingBadge.setOnClickListener(null);
-                    Toast.makeText(InCallActivity.this, "Receiver Mode Active: In-Call Data Transfer Started", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(InCallActivity.this, "Receiver Active: Receiving In-Call Audio Stream", Toast.LENGTH_SHORT).show();
                 });
             } else if (FileAssembler.ACTION_TRANSFER_PROGRESS.equals(action)) {
                 String status = intent.getStringExtra(FileAssembler.EXTRA_STATUS);
@@ -134,7 +136,6 @@ public class InCallActivity extends AppCompatActivity {
                     if ("COMPLETED".equalsIgnoreCase(status)) {
                         tvRecordingBadge.setText("⚡ TRANSFER COMPLETE (100%)");
                         tvRecordingBadge.setOnClickListener(null);
-                        // Auto-hide the completion badge after 3 seconds
                         badgeDismissRunnable = () -> {
                             if (tvRecordingBadge != null && !isRecording) {
                                 tvRecordingBadge.setVisibility(View.GONE);
@@ -153,12 +154,12 @@ public class InCallActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Native Storage Picker for In-Call Photo / File Transmission
+        // Native Storage Picker for In-Call File/Photo Transmission
         inCallFilePickerLauncher = registerForActivityResult(
                 new ActivityResultContracts.GetContent(),
                 uri -> {
                     if (uri != null) {
-                        transmitPickedImageOverCall(uri);
+                        transmitPickedFileOverCall(uri);
                     }
                 }
         );
@@ -181,7 +182,6 @@ public class InCallActivity extends AppCompatActivity {
 
         setContentView(R.layout.activity_in_call);
 
-        // Retrieve call direction flag from AirSignalInCallService
         isIncomingCall = getIntent().getBooleanExtra("is_incoming", false);
 
         dbHelper = DatabaseHelper.getInstance(this);
@@ -222,7 +222,6 @@ public class InCallActivity extends AppCompatActivity {
 
         setupControls();
 
-        // Register in-call receiver mode & progress filters
         IntentFilter filter = new IntentFilter();
         filter.addAction(AudioTransferService.ACTION_RECEIVER_MODE_ACTIVE);
         filter.addAction(FileAssembler.ACTION_TRANSFER_PROGRESS);
@@ -285,10 +284,8 @@ public class InCallActivity extends AppCompatActivity {
                     isCallConnected = true;
                     tvCallStatus.setText("00:00");
                     startCallTimer();
-                    AirLogger.i(TAG, "Call state ACTIVE - started call duration timer");
+                    AirLogger.i(TAG, "Call state ACTIVE - started duration timer");
 
-                    // Only show transmission action on the Sender Phone.
-                    // Receiver Phone (isIncomingCall == true) stays GONE until it hears actual data.
                     if (tvRecordingBadge != null && !isRecording) {
                         if (!isIncomingCall) {
                             tvRecordingBadge.setVisibility(View.VISIBLE);
@@ -312,7 +309,7 @@ public class InCallActivity extends AppCompatActivity {
                 break;
             case android.telecom.Call.STATE_DISCONNECTED:
             case android.telecom.Call.STATE_DISCONNECTING:
-                AirLogger.i(TAG, "Telecom Call disconnected/disconnecting");
+                AirLogger.i(TAG, "Telecom Call disconnected");
                 endCall();
                 break;
         }
@@ -324,7 +321,6 @@ public class InCallActivity extends AppCompatActivity {
             return;
         }
 
-        // 1. Check local app Database
         List<com.example.models.User> dbUsers = dbHelper.getAllUsers();
         for (com.example.models.User u : dbUsers) {
             if (cleanNum(u.getPhone()).equals(cleanNum(phoneNumber))) {
@@ -333,7 +329,6 @@ public class InCallActivity extends AppCompatActivity {
             }
         }
 
-        // 2. Check System Contacts
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
             try {
                 ContentResolver resolver = getContentResolver();
@@ -375,7 +370,6 @@ public class InCallActivity extends AppCompatActivity {
         handler.postDelayed(() -> {
             if (!isFinishing() && !isCallConnected) {
                 tvCallStatus.setText("Ringing...");
-                AirLogger.i(TAG, "startCallSequence: Outgoing call ringing...");
             }
         }, 2000);
     }
@@ -425,7 +419,6 @@ public class InCallActivity extends AppCompatActivity {
             });
         }
 
-        // Mute
         btnMute.setOnClickListener(v -> {
             isMuted = !isMuted;
             if (audioManager != null) {
@@ -446,7 +439,6 @@ public class InCallActivity extends AppCompatActivity {
             }
         });
 
-        // Speaker (Click = Toggle Speaker, Long Click = In-Call Data Transfer Hub)
         btnSpeaker.setOnClickListener(v -> {
             isSpeakerOn = !isSpeakerOn;
             if (audioManager != null) {
@@ -472,7 +464,6 @@ public class InCallActivity extends AppCompatActivity {
             return true;
         });
 
-        // Keypad
         btnKeypad.setOnClickListener(v -> {
             isKeypadVisible = !isKeypadVisible;
             layoutInCallKeypad.setVisibility(isKeypadVisible ? View.VISIBLE : View.GONE);
@@ -485,7 +476,6 @@ public class InCallActivity extends AppCompatActivity {
             }
         });
 
-        // DTMF buttons
         int[] dtmfIds = {
                 R.id.dtmf1, R.id.dtmf2, R.id.dtmf3,
                 R.id.dtmf4, R.id.dtmf5, R.id.dtmf6,
@@ -503,7 +493,6 @@ public class InCallActivity extends AppCompatActivity {
             }
         }
 
-        // Live Record
         btnRecord.setOnClickListener(v -> {
             if (isRecording) {
                 stopLiveRecording();
@@ -521,68 +510,130 @@ public class InCallActivity extends AppCompatActivity {
             return true;
         });
 
-        // End Call
         btnEndCall.setOnClickListener(v -> endCall());
     }
 
     /**
-     * In-Call Data Transfer Action Dialog (Send Photo or Emergency Template during live call)
+     * Clean In-Call Data Transfer Hub (File, Emergency Token, or Custom Text)
      */
     private void showInCallDataTransferDialog() {
         CharSequence[] options = new CharSequence[]{
-                "Send Real Photo from Gallery over Call",
-                "Send Instant Flood/Disaster Hazard Marker (~0.8s)",
-                "Send Medical Emergency Triage Token (~0.8s)"
+                "1. Send Photo / File from Storage over Call",
+                "2. Send Quick Emergency Text (SOS / OK / LOCATION)",
+                "3. Paste Custom Base64 / Text Payload"
         };
 
         new AlertDialog.Builder(this)
                 .setTitle("In-Call Acoustic Data Transfer")
                 .setItems(options, (dialog, which) -> {
                     if (which == 0) {
-                        inCallFilePickerLauncher.launch("image/*");
+                        inCallFilePickerLauncher.launch("*/*");
                     } else if (which == 1) {
-                        transmitInCallTemplateToken(TemplateCatalog.TEMPLATE_CHALAKUDY_SECTOR_MAP, TemplateToken.ICON_FLOOD, "Flood Hazard (2.4m)");
+                        showQuickEmergencySelectionDialog();
                     } else if (which == 2) {
-                        transmitInCallTemplateToken(TemplateCatalog.TEMPLATE_MEDICAL_TRIAGE_REPORT, TemplateToken.ICON_MEDICAL, "Medical Triage RED");
+                        showInCallPasteDialog();
                     }
                 })
                 .show();
     }
 
-    private void transmitInCallTemplateToken(int templateId, int iconId, String label) {
-        TemplateToken token = new TemplateToken(
-                TemplateToken.MODE_PHONETIC_TOKEN,
-                TemplateToken.CATEGORY_TACTICAL_MAP,
-                templateId,
-                18500,
-                35000,
-                iconId,
-                TemplateToken.SEVERITY_CRITICAL,
-                240,
-                0
-        );
+    private void showQuickEmergencySelectionDialog() {
+        CharSequence[] messages = new CharSequence[]{
+                "🚨 SOS: IMMEDIATE ASSISTANCE REQUIRED",
+                "✅ STATUS OK: EVACUATED TO SAFE ZONE",
+                "🏥 MEDICAL: CASUALTY REPORTED",
+                "🔓 COMMAND: UNLOCK ACCESS DOOR 123",
+                "📍 LOCATION: WATER LEVEL ELEVATED"
+        };
 
-        String nato = PhoneticTokenManager.encodeToPhoneticWords(token);
-        AirLogger.i(TAG, "Transmitting in-call token: " + nato);
-
-        Intent intent = new Intent(this, AudioTransferService.class);
-        intent.setAction(AudioTransferService.ACTION_SEND_TOKEN);
-        intent.putExtra(AudioTransferService.EXTRA_TOKEN_PAYLOAD, token.toByteArray());
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
-        }
-
-        Toast.makeText(this, "Transmitting " + label + " over call audio...", Toast.LENGTH_SHORT).show();
+        new AlertDialog.Builder(this)
+                .setTitle("Select Quick Emergency Message")
+                .setItems(messages, (dialog, which) -> {
+                    String msg = messages[which].toString();
+                    transmitTextPayloadOverCall(msg, "emergency_msg.txt");
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
-    private void transmitPickedImageOverCall(Uri uri) {
+    private void showInCallPasteDialog() {
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(32, 24, 32, 24);
+
+        TextView tvInfo = new TextView(this);
+        tvInfo.setText("Paste Base64 or text to stream into the ongoing call:");
+        tvInfo.setTextSize(13);
+        layout.addView(tvInfo);
+
+        final EditText etInput = new EditText(this);
+        etInput.setHint("Paste payload here...");
+        etInput.setMinLines(4);
+        etInput.setMaxLines(8);
+        etInput.setTypeface(Typeface.MONOSPACE);
+        etInput.setTextSize(13);
+        layout.addView(etInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Transmit Custom Text")
+                .setView(layout)
+                .setPositiveButton("Stream into Call", (dialog, which) -> {
+                    String text = etInput.getText().toString().trim();
+                    if (!text.isEmpty()) {
+                        transmitTextPayloadOverCall(text, "incall_text_payload.txt");
+                    } else {
+                        Toast.makeText(this, "Text cannot be empty", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void transmitTextPayloadOverCall(String payload, String fileName) {
         try {
+            File tempFile = new File(getCacheDir(), fileName);
+            FileOutputStream fos = new FileOutputStream(tempFile);
+            fos.write(payload.getBytes(StandardCharsets.UTF_8));
+            fos.flush();
+            fos.close();
+
+            String fileId = "CALL_TX_" + UUID.randomUUID().toString().substring(0, 8);
+
+            Intent intent = new Intent(this, AudioTransferService.class);
+            intent.setAction(AudioTransferService.ACTION_SEND_AUDIO_DATA);
+            intent.putExtra(AudioTransferService.EXTRA_FILE_PATH, tempFile.getAbsolutePath());
+            intent.putExtra(AudioTransferService.EXTRA_FILE_NAME, fileName);
+            intent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, tempFile.length());
+            intent.putExtra(AudioTransferService.EXTRA_FILE_ID, fileId);
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+
+            Toast.makeText(this, "Streaming data into active call...", Toast.LENGTH_SHORT).show();
+
+        } catch (Exception e) {
+            AirLogger.e(TAG, "Error staging in-call text transmission", e);
+            Toast.makeText(this, "Failed staging payload: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void transmitPickedFileOverCall(Uri uri) {
+        try {
+            Cursor cursor = getContentResolver().query(uri, null, null, null, null);
+            String fileName = "incall_file.bin";
+            if (cursor != null && cursor.moveToFirst()) {
+                int nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (nameIdx != -1) fileName = cursor.getString(nameIdx);
+                cursor.close();
+            }
+
             InputStream is = getContentResolver().openInputStream(uri);
             if (is == null) return;
 
-            File tempFile = new File(getCacheDir(), "incall_photo_transfer.webp");
+            File tempFile = new File(getCacheDir(), fileName);
             FileOutputStream fos = new FileOutputStream(tempFile);
             byte[] buf = new byte[8192];
             int len;
@@ -593,22 +644,26 @@ public class InCallActivity extends AppCompatActivity {
             fos.close();
             is.close();
 
+            String fileId = "CALL_FILE_" + UUID.randomUUID().toString().substring(0, 8);
+
             Intent intent = new Intent(this, AudioTransferService.class);
-            intent.setAction(AudioTransferService.ACTION_SEND_PHONETIC_IMAGE);
-            intent.putExtra(AudioTransferService.EXTRA_IMAGE_PATH, tempFile.getAbsolutePath());
-            intent.putExtra(AudioTransferService.EXTRA_FILE_NAME, "incall_photo.webp");
+            intent.setAction(AudioTransferService.ACTION_SEND_AUDIO_DATA);
+            intent.putExtra(AudioTransferService.EXTRA_FILE_PATH, tempFile.getAbsolutePath());
+            intent.putExtra(AudioTransferService.EXTRA_FILE_NAME, fileName);
             intent.putExtra(AudioTransferService.EXTRA_FILE_SIZE, tempFile.length());
+            intent.putExtra(AudioTransferService.EXTRA_FILE_ID, fileId);
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent);
             } else {
                 startService(intent);
             }
 
-            Toast.makeText(this, "Transmitting Photo over call stream...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Streaming file (" + (tempFile.length() / 1024) + " KB) over call audio...", Toast.LENGTH_SHORT).show();
 
         } catch (Exception e) {
-            AirLogger.e(TAG, "Failed reading in-call picked image", e);
-            Toast.makeText(this, "Failed loading image from gallery", Toast.LENGTH_SHORT).show();
+            AirLogger.e(TAG, "Failed reading in-call picked file", e);
+            Toast.makeText(this, "Failed loading file from storage", Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -715,7 +770,6 @@ public class InCallActivity extends AppCompatActivity {
 
         AirSignalInCallService.disconnectActiveCall();
 
-        // Save call log in database with contact resolution
         CallLogItem callItem = new CallLogItem(
                 0,
                 phoneNumber,
